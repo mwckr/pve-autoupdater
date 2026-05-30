@@ -122,6 +122,8 @@ acquire_lock() {
 
 cleanup_old_logs() {
     find "$LOG_DIR" -name "update-*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    find "$LOG_DIR" -name "app-update-*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    find /usr/local/community-scripts/update_apps -name "*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -503,13 +505,29 @@ run_app_updates() {
     sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$app_log" 2>/dev/null
 
     if [ $rc -eq 0 ]; then
-        APP_STATUS="completed"
         log "APPS: update-apps.sh finished successfully (see $app_log)"
     else
-        APP_STATUS="failed (exit $rc)"
         FAIL_LIST+=("app-updates [exit $rc]")
         ((FAILED++))
         log "FAIL: update-apps.sh exited with code $rc (see $app_log)"
+    fi
+
+    # Parse the summary table from the log for the notification.
+    # Lines look like: "  102       karakeep                OK          Updated successfully"
+    local app_ok app_fail ok_names fail_names
+    app_ok=$(grep -P '^\s+\d+\s+\S+\s+OK\b' "$app_log" 2>/dev/null | wc -l)
+    app_fail=$(grep -P '^\s+\d+\s+\S+\s+FAILED\b' "$app_log" 2>/dev/null | wc -l)
+    ok_names=$(grep -P '^\s+\d+\s+\S+\s+OK\b' "$app_log" 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+    fail_names=$(grep -P '^\s+\d+\s+\S+\s+FAILED\b' "$app_log" 2>/dev/null | awk '{print $2}' | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+
+    if [ "$app_fail" -gt 0 ]; then
+        APP_STATUS="${app_ok} OK, ${app_fail} FAILED (${fail_names})"
+    elif [ "$app_ok" -gt 0 ]; then
+        APP_STATUS="${app_ok} OK (${ok_names})"
+    elif [ $rc -eq 0 ]; then
+        APP_STATUS="completed (no updates needed)"
+    else
+        APP_STATUS="failed (exit $rc)"
     fi
 }
 
