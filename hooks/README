@@ -1,0 +1,25 @@
+# Hooks Directory
+
+Place custom scripts here to run before or after a resource is updated.
+
+## Naming Convention
+
+    <CTID>-pre.sh     Runs INSIDE the container BEFORE apt/docker updates
+    <CTID>-post.sh    Runs INSIDE the container AFTER apt/docker updates
+
+## Examples
+
+Stop a service before upgrading, restart after:
+
+    # File: 108-pre.sh
+    systemctl stop plexmediaserver
+
+    # File: 108-post.sh
+    systemctl start plexmediaserver
+
+Run a custom update command for a service:
+
+    # File: 119-post.sh
+    cd /opt/n8n && npm update -g n8n
+
+Note: Hooks currently only work for LXC containers (executed via pct exec).
