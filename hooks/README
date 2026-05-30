@@ -22,4 +22,12 @@ Run a custom update command for a service:
     # File: 119-post.sh
     cd /opt/n8n && npm update -g n8n
 
+## Security
+
+Hook files must be owned by root and must NOT be group- or world-writable.
+The script will skip any hook that fails this check and log a warning.
+
+    chown root:root hooks/*.sh
+    chmod 700 hooks/*.sh
+
 Note: Hooks currently only work for LXC containers (executed via pct exec).

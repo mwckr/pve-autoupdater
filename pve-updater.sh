@@ -14,7 +14,6 @@
 # Designed to run via cron on the Proxmox VE host.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── Strict mode (no set -e: we handle errors per-resource) ──
 set -uo pipefail
 
 # ── Paths ──
@@ -22,21 +21,43 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESOURCES_FILE="$SCRIPT_DIR/resources.conf"
 HOOKS_DIR="$SCRIPT_DIR/hooks"
 LOG_DIR="$SCRIPT_DIR/logs"
-LOCK_FILE="/tmp/pve-updater.lock"
+LOCK_FILE="$SCRIPT_DIR/pve-updater.lock"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/update-$TIMESTAMP.log"
 
+# ── Preflight: verify we're on a PVE host ──
+for cmd in pct qm; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: '$cmd' not found. This script must run on a Proxmox VE host."
+        exit 1
+    fi
+done
+
 # ── Load settings ──
 if [ ! -f "$SCRIPT_DIR/settings.conf" ]; then
-    echo "❌ settings.conf not found."
-    echo "   First run? Copy the example and fill in your values:"
+    echo "ERROR: settings.conf not found."
+    echo "  First run? Copy the example and fill in your values:"
     echo ""
-    echo "   cp $SCRIPT_DIR/settings.conf.example $SCRIPT_DIR/settings.conf"
-    echo "   nano $SCRIPT_DIR/settings.conf"
+    echo "  cp $SCRIPT_DIR/settings.conf.example $SCRIPT_DIR/settings.conf"
+    echo "  nano $SCRIPT_DIR/settings.conf"
     echo ""
     exit 1
 fi
 source "$SCRIPT_DIR/settings.conf"
+
+# ── Validate required settings ──
+: "${NTFY_URL:?settings.conf: NTFY_URL is not set}"
+: "${NTFY_TOKEN:?settings.conf: NTFY_TOKEN is not set}"
+: "${NTFY_TOPIC:?settings.conf: NTFY_TOPIC is not set}"
+: "${APT_TIMEOUT:?settings.conf: APT_TIMEOUT is not set}"
+: "${DOCKER_TIMEOUT:?settings.conf: DOCKER_TIMEOUT is not set}"
+: "${LOG_RETENTION_DAYS:?settings.conf: LOG_RETENTION_DAYS is not set}"
+
+if [ "$NTFY_TOKEN" = "YOUR_NTFY_TOKEN" ] || [ "$NTFY_URL" = "http://YOUR_NTFY_IP" ]; then
+    echo "ERROR: settings.conf still has placeholder values. Edit it first:"
+    echo "  nano $SCRIPT_DIR/settings.conf"
+    exit 1
+fi
 
 # ── CLI flags ──
 DRY_RUN=false
@@ -56,7 +77,6 @@ SKIPPED=0
 declare -a REBOOT_LIST=()
 declare -a DOCKER_LIST=()
 declare -a FAIL_LIST=()
-declare -a SUCCESS_LIST=()
 PVE_STATUS=""
 START_TIME=$(date +%s)
 
@@ -79,14 +99,14 @@ acquire_lock() {
         pid=$(cat "$LOCK_FILE" 2>/dev/null)
         if kill -0 "$pid" 2>/dev/null; then
             if [ "$FORCE" = true ]; then
-                log "⚠️  Overriding existing lock (PID $pid) due to --force"
+                log "WARN: Overriding existing lock (PID $pid) due to --force"
                 rm -f "$LOCK_FILE"
             else
-                log "❌ Another instance is running (PID $pid). Use --force to override."
+                log "FAIL: Another instance is running (PID $pid). Use --force to override."
                 exit 1
             fi
         else
-            log "⚠️  Removing stale lock file (PID $pid no longer running)"
+            log "WARN: Removing stale lock file (PID $pid no longer running)"
             rm -f "$LOCK_FILE"
         fi
     fi
@@ -108,51 +128,43 @@ run_apt_lxc() {
     local status
     status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
     if [ "$status" != "running" ]; then
-        log "⏭️  $name ($ctid): skipped — not running"
+        log "SKIP: $name ($ctid) -- not running"
         ((SKIPPED++))
         return 0
     fi
 
     if [ "$DRY_RUN" = true ]; then
-        log "🔍 $name ($ctid): would run apt upgrade [dry-run]"
+        log "DRY-RUN: $name ($ctid) -- would run apt upgrade"
         ((SKIPPED++))
         return 0
     fi
 
-    log "📦 $name ($ctid): apt update & upgrade …"
+    log "APT: $name ($ctid) -- update & upgrade"
 
     local output rc
     output=$(timeout "$APT_TIMEOUT" pct exec "$ctid" -- bash -l -c "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq 2>&1
+        apt-get update -qq 2>&1 && \
         apt-get upgrade -y -o Dpkg::Options::='--force-confold' -o Dpkg::Options::='--force-confdef' 2>&1
-    " 2>&1) || true
-    rc=${PIPESTATUS[0]:-$?}
+    " 2>&1)
+    rc=$?
 
-    # Count upgraded packages from output
     local upgraded_count
-    upgraded_count=$(echo "$output" | grep -c "^Inst " 2>/dev/null || echo "0")
-
-    if echo "$output" | grep -qiE "(E: |Err:|dpkg error|FATAL)"; then
-        rc=1
-    fi
+    upgraded_count=$(echo "$output" | grep -oP '^\d+ upgraded' | grep -oP '^\d+' || echo "0")
 
     if [ "$rc" -eq 0 ]; then
-        # Check reboot required
         local reboot
         reboot=$(pct exec "$ctid" -- bash -c '[ -f /var/run/reboot-required ] && echo YES || echo NO' 2>/dev/null || echo "UNKNOWN")
         if [ "$reboot" = "YES" ]; then
             REBOOT_LIST+=("$name ($ctid)")
-            log "✅ $name ($ctid): $upgraded_count upgraded — reboot pending"
+            log "OK: $name ($ctid) -- $upgraded_count upgraded, reboot pending"
         else
-            log "✅ $name ($ctid): $upgraded_count upgraded"
+            log "OK: $name ($ctid) -- $upgraded_count upgraded"
         fi
-        SUCCESS_LIST+=("$name")
         ((SUCCESS++))
     else
         FAIL_LIST+=("$name ($ctid)")
-        log "❌ $name ($ctid): apt failed (exit $rc)"
-        # Log last 10 lines for debugging
+        log "FAIL: $name ($ctid) -- apt failed (exit $rc)"
         echo "$output" | tail -10 | while IFS= read -r line; do
             log_detail "$line"
         done
@@ -170,11 +182,11 @@ run_docker_lxc() {
     fi
 
     if [ "$DRY_RUN" = true ]; then
-        log "🔍 $name ($ctid): would update Docker stacks [dry-run]"
+        log "DRY-RUN: $name ($ctid) -- would update Docker stacks"
         return 0
     fi
 
-    log "🐳 $name ($ctid): updating Docker stacks …"
+    log "DOCKER: $name ($ctid) -- updating stacks"
 
     local output rc
     output=$(timeout "$DOCKER_TIMEOUT" pct exec "$ctid" -- bash -l -c '
@@ -188,31 +200,53 @@ run_docker_lxc() {
             echo ">> Stack: $dir"
             cd "$dir" || continue
 
-            pull_out=$(docker compose pull 2>&1)
+            if ! pull_out=$(docker compose pull 2>&1); then
+                echo "   FAIL: pull failed"
+                echo "$pull_out" | tail -3
+                ((errors++))
+                continue
+            fi
+
             if echo "$pull_out" | grep -q "Downloaded newer image"; then
                 echo "   Pulled new images"
-                docker compose up -d --remove-orphans 2>&1
-                ((updated++))
+                if ! docker compose up -d --remove-orphans 2>&1; then
+                    echo "   FAIL: restart failed"
+                    ((errors++))
+                else
+                    ((updated++))
+                fi
             else
                 echo "   Already up to date"
             fi
         done
 
-        # Prune dangling images to free space
         docker image prune -f > /dev/null 2>&1 || true
 
-        echo "DOCKER_SUMMARY: updated=$updated"
-    ' 2>&1) || true
+        echo "DOCKER_SUMMARY: updated=$updated errors=$errors"
+        exit $errors
+    ' 2>&1)
     rc=$?
+
+    local docker_errors
+    docker_errors=$(echo "$output" | grep -oP 'errors=\K\d+' || echo "0")
 
     if [ $rc -eq 0 ]; then
         DOCKER_LIST+=("$name ($ctid)")
-        log "🐳 $name ($ctid): Docker stacks processed"
+        log "DOCKER: $name ($ctid) -- stacks processed"
+    elif [ "$docker_errors" -gt 0 ]; then
+        FAIL_LIST+=("$name ($ctid) [docker: ${docker_errors} failed]")
+        log "FAIL: $name ($ctid) -- docker: $docker_errors stack(s) had errors"
+        echo "$output" | tail -8 | while IFS= read -r line; do
+            log_detail "$line"
+        done
+        ((FAILED++))
     else
-        log "⚠️  $name ($ctid): Docker update had issues (exit $rc)"
+        FAIL_LIST+=("$name ($ctid) [docker: exit $rc]")
+        log "FAIL: $name ($ctid) -- docker update failed (exit $rc)"
         echo "$output" | tail -5 | while IFS= read -r line; do
             log_detail "$line"
         done
+        ((FAILED++))
     fi
 }
 
@@ -222,58 +256,56 @@ run_apt_vm() {
     local status
     status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
     if [ "$status" != "running" ]; then
-        log "⏭️  $name ($vmid): skipped — not running"
+        log "SKIP: $name ($vmid) -- not running"
         ((SKIPPED++))
         return 0
     fi
 
     if [ -z "$ip" ] || [ "$ip" = "CHANGE_ME" ]; then
-        log "⚠️  $name ($vmid): skipped — no IP configured in resources.conf"
+        log "WARN: $name ($vmid) -- skipped, no IP configured in resources.conf"
         ((SKIPPED++))
         return 0
     fi
 
     if [ "$DRY_RUN" = true ]; then
-        log "🔍 $name ($vmid): would run apt upgrade via SSH to $ip [dry-run]"
+        log "DRY-RUN: $name ($vmid) -- would run apt upgrade via SSH to $ip"
         ((SKIPPED++))
         return 0
     fi
 
-    log "📦 $name ($vmid): apt update & upgrade via SSH ($ip) …"
+    log "APT: $name ($vmid) -- update & upgrade via SSH ($ip)"
 
-    # Test SSH connectivity first
-    if ! timeout 10 ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+    if ! timeout 10 ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=yes \
         -o BatchMode=yes root@"$ip" "echo ok" &>/dev/null; then
         FAIL_LIST+=("$name ($vmid) [SSH unreachable]")
-        log "❌ $name ($vmid): SSH connection failed to $ip"
+        log "FAIL: $name ($vmid) -- SSH connection failed to $ip"
         ((FAILED++))
         return 1
     fi
 
     local output rc
     output=$(timeout "$APT_TIMEOUT" ssh -o ConnectTimeout=10 -o BatchMode=yes \
-        root@"$ip" "
+        -o StrictHostKeyChecking=yes root@"$ip" "
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq 2>&1
+        apt-get update -qq 2>&1 && \
         apt-get upgrade -y -o Dpkg::Options::='--force-confold' -o Dpkg::Options::='--force-confdef' 2>&1
-    " 2>&1) || true
+    " 2>&1)
     rc=$?
 
     if [ "$rc" -eq 0 ]; then
         local reboot
-        reboot=$(ssh -o ConnectTimeout=5 -o BatchMode=yes root@"$ip" \
-            '[ -f /var/run/reboot-required ] && echo YES || echo NO' 2>/dev/null || echo "UNKNOWN")
+        reboot=$(ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            root@"$ip" '[ -f /var/run/reboot-required ] && echo YES || echo NO' 2>/dev/null || echo "UNKNOWN")
         if [ "$reboot" = "YES" ]; then
             REBOOT_LIST+=("$name ($vmid)")
-            log "✅ $name ($vmid): upgraded — reboot pending"
+            log "OK: $name ($vmid) -- upgraded, reboot pending"
         else
-            log "✅ $name ($vmid): upgraded"
+            log "OK: $name ($vmid) -- upgraded"
         fi
-        SUCCESS_LIST+=("$name")
         ((SUCCESS++))
     else
         FAIL_LIST+=("$name ($vmid)")
-        log "❌ $name ($vmid): apt failed (exit $rc)"
+        log "FAIL: $name ($vmid) -- apt failed (exit $rc)"
         echo "$output" | tail -10 | while IFS= read -r line; do
             log_detail "$line"
         done
@@ -295,33 +327,69 @@ run_docker_vm() {
     fi
 
     if [ "$DRY_RUN" = true ]; then
-        log "🔍 $name ($vmid): would update Docker stacks via SSH [dry-run]"
+        log "DRY-RUN: $name ($vmid) -- would update Docker stacks via SSH"
         return 0
     fi
 
-    log "🐳 $name ($vmid): updating Docker stacks via SSH ($ip) …"
+    log "DOCKER: $name ($vmid) -- updating stacks via SSH ($ip)"
 
     local output rc
     output=$(timeout "$DOCKER_TIMEOUT" ssh -o ConnectTimeout=10 -o BatchMode=yes \
-        root@"$ip" '
+        -o StrictHostKeyChecking=yes root@"$ip" '
+        updated=0
+        errors=0
         for f in $(find /opt /root /home /srv /data -maxdepth 5 \
             \( -name "docker-compose.yml" -o -name "docker-compose.yaml" \
                -o -name "compose.yml" -o -name "compose.yaml" \) 2>/dev/null); do
             dir=$(dirname "$f")
             echo ">> Stack: $dir"
             cd "$dir" || continue
-            docker compose pull 2>&1
-            docker compose up -d --remove-orphans 2>&1
+
+            if ! pull_out=$(docker compose pull 2>&1); then
+                echo "   FAIL: pull failed"
+                echo "$pull_out" | tail -3
+                ((errors++))
+                continue
+            fi
+
+            if echo "$pull_out" | grep -q "Downloaded newer image"; then
+                echo "   Pulled new images"
+                if ! docker compose up -d --remove-orphans 2>&1; then
+                    echo "   FAIL: restart failed"
+                    ((errors++))
+                else
+                    ((updated++))
+                fi
+            else
+                echo "   Already up to date"
+            fi
         done
         docker image prune -f > /dev/null 2>&1 || true
-    ' 2>&1) || true
+        echo "DOCKER_SUMMARY: updated=$updated errors=$errors"
+        exit $errors
+    ' 2>&1)
     rc=$?
+
+    local docker_errors
+    docker_errors=$(echo "$output" | grep -oP 'errors=\K\d+' || echo "0")
 
     if [ $rc -eq 0 ]; then
         DOCKER_LIST+=("$name ($vmid)")
-        log "🐳 $name ($vmid): Docker stacks processed"
+        log "DOCKER: $name ($vmid) -- stacks processed"
+    elif [ "$docker_errors" -gt 0 ]; then
+        FAIL_LIST+=("$name ($vmid) [docker: ${docker_errors} failed]")
+        log "FAIL: $name ($vmid) -- docker: $docker_errors stack(s) had errors"
+        echo "$output" | tail -8 | while IFS= read -r line; do
+            log_detail "$line"
+        done
+        ((FAILED++))
     else
-        log "⚠️  $name ($vmid): Docker update had issues (exit $rc)"
+        FAIL_LIST+=("$name ($vmid) [docker: exit $rc]")
+        log "FAIL: $name ($vmid) -- docker update failed (exit $rc)"
+        echo "$output" | tail -5 | while IFS= read -r line; do
+            log_detail "$line"
+        done
+        ((FAILED++))
     fi
 }
 
@@ -330,47 +398,74 @@ run_hooks() {
 
     local hook_file="$HOOKS_DIR/${id}-${phase}.sh"
     if [ -f "$hook_file" ]; then
-        log "🪝 $name ($id): running $phase hook …"
+        local hook_owner hook_perms
+        hook_owner=$(stat -c '%u' "$hook_file")
+        hook_perms=$(stat -c '%a' "$hook_file")
+
+        if [ "$hook_owner" != "0" ]; then
+            log "WARN: $name ($id) -- skipping $phase hook, not owned by root (uid $hook_owner)"
+            return 1
+        fi
+
+        # Extract group and other digits via string slicing, then check write bit.
+        # Works for both 3-digit (755) and 4-digit (4755) stat output.
+        local group_digit="${hook_perms: -2:1}"
+        local other_digit="${hook_perms: -1:1}"
+        if (( group_digit & 2 )) || (( other_digit & 2 )); then
+            log "WARN: $name ($id) -- skipping $phase hook, group/world-writable (mode $hook_perms)"
+            return 1
+        fi
+
+        log "HOOK: $name ($id) -- running $phase hook"
         if [ "$type" = "lxc" ]; then
             pct exec "$id" -- bash -l < "$hook_file" >> "$LOG_FILE" 2>&1 || \
-                log "⚠️  $name ($id): $phase hook returned non-zero"
+                log "WARN: $name ($id) -- $phase hook returned non-zero"
         fi
-        # VM hooks would need SSH, but for simplicity we skip those for now
     fi
 }
 
 update_pve_host() {
-    log "🖥️  PVE host: checking for updates …"
+    log "PVE: checking for updates"
 
     if [ "$DRY_RUN" = true ]; then
-        log "🔍 PVE host: would run apt upgrade [dry-run]"
+        log "DRY-RUN: PVE host -- would run apt upgrade"
         PVE_STATUS="dry-run"
         return 0
     fi
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >> "$LOG_FILE" 2>&1
+
+    if ! apt-get update -qq >> "$LOG_FILE" 2>&1; then
+        PVE_STATUS="apt update failed -- check log"
+        log "WARN: PVE host -- apt-get update failed"
+        return 1
+    fi
 
     local upgradeable
     upgradeable=$(apt list --upgradeable 2>/dev/null | grep -v "^Listing" | wc -l)
 
     if [ "$upgradeable" -gt 0 ]; then
-        log "🖥️  PVE host: $upgradeable packages to upgrade — installing …"
-        apt-get upgrade -y \
+        log "PVE: $upgradeable packages to upgrade -- installing"
+        if apt-get upgrade -y \
             -o Dpkg::Options::='--force-confold' \
-            -o Dpkg::Options::='--force-confdef' >> "$LOG_FILE" 2>&1 || true
+            -o Dpkg::Options::='--force-confdef' >> "$LOG_FILE" 2>&1; then
 
-        if [ -f /var/run/reboot-required ]; then
-            PVE_STATUS="$upgradeable upgraded — ⚠️ REBOOT PENDING"
-            REBOOT_LIST+=("PVE host")
+            if [ -f /var/run/reboot-required ]; then
+                PVE_STATUS="$upgradeable upgraded -- REBOOT PENDING"
+                REBOOT_LIST+=("PVE host")
+            else
+                PVE_STATUS="$upgradeable upgraded"
+            fi
         else
-            PVE_STATUS="$upgradeable upgraded"
+            PVE_STATUS="apt upgrade failed -- check log"
+            FAIL_LIST+=("PVE host")
+            ((FAILED++))
         fi
     else
         PVE_STATUS="already up to date"
     fi
 
-    log "🖥️  PVE host: $PVE_STATUS"
+    log "PVE: $PVE_STATUS"
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -384,42 +479,39 @@ send_ntfy() {
     local minutes=$(( duration / 60 ))
     local seconds=$(( duration % 60 ))
 
-    # Determine priority & emoji based on results
     local priority="3"
     local tag="package,white_check_mark"
-    local title="✅ Proxmox Updates Complete"
+    local title="Proxmox Updates Complete"
 
     if [ ${#FAIL_LIST[@]} -gt 0 ]; then
         priority="4"
         tag="package,warning"
-        title="⚠️ Proxmox Updates — ${#FAIL_LIST[@]} Failed"
+        title="Proxmox Updates -- ${#FAIL_LIST[@]} Failed"
     fi
 
-    # Build message body
     local msg=""
     msg+="Updated: $SUCCESS / $TOTAL"
 
     if [ "$SKIPPED" -gt 0 ]; then
-        msg+="  •  Skipped: $SKIPPED"
+        msg+="  |  Skipped: $SKIPPED"
     fi
 
     if [ ${#FAIL_LIST[@]} -gt 0 ]; then
-        msg+=$'\n'"❌ Failed: $(IFS=', '; echo "${FAIL_LIST[*]}")"
+        msg+=$'\n'"Failed: $(IFS=', '; echo "${FAIL_LIST[*]}")"
     fi
 
     if [ ${#REBOOT_LIST[@]} -gt 0 ]; then
-        msg+=$'\n'"🔄 Reboot pending: $(IFS=', '; echo "${REBOOT_LIST[*]}")"
+        msg+=$'\n'"Reboot pending: $(IFS=', '; echo "${REBOOT_LIST[*]}")"
     fi
 
     if [ ${#DOCKER_LIST[@]} -gt 0 ]; then
-        msg+=$'\n'"🐳 Docker updated: $(IFS=', '; echo "${DOCKER_LIST[*]}")"
+        msg+=$'\n'"Docker updated: $(IFS=', '; echo "${DOCKER_LIST[*]}")"
     fi
 
-    msg+=$'\n'"🖥️ PVE host: $PVE_STATUS"
-    msg+=$'\n'"⏱️ Duration: ${minutes}m ${seconds}s"
+    msg+=$'\n'"PVE host: $PVE_STATUS"
+    msg+=$'\n'"Duration: ${minutes}m ${seconds}s"
 
-    # Send via ntfy
-    curl -s \
+    curl -s --max-time 15 \
         -H "Authorization: Bearer $NTFY_TOKEN" \
         -H "Title: $title" \
         -H "Priority: $priority" \
@@ -429,9 +521,9 @@ send_ntfy() {
 
     local ntfy_rc=$?
     if [ $ntfy_rc -eq 0 ]; then
-        log "📨 Notification sent to ntfy"
+        log "NTFY: notification sent"
     else
-        log "⚠️  Failed to send ntfy notification (curl exit $ntfy_rc)"
+        log "WARN: failed to send ntfy notification (curl exit $ntfy_rc)"
     fi
 }
 
@@ -442,34 +534,31 @@ send_ntfy() {
 main() {
     mkdir -p "$LOG_DIR" "$HOOKS_DIR"
     acquire_lock
-    cleanup_old_logs
+
+    [ "$DRY_RUN" = false ] && cleanup_old_logs
 
     log "════════════════════════════════════════════════════"
     log "  PVE Updater started  $(date '+%Y-%m-%d %H:%M:%S')"
-    [ "$DRY_RUN" = true ] && log "  *** DRY RUN — no changes will be made ***"
+    [ "$DRY_RUN" = true ] && log "  *** DRY RUN -- no changes will be made ***"
     log "════════════════════════════════════════════════════"
 
-    # ── Read resources.conf and process each entry ──
     if [ ! -f "$RESOURCES_FILE" ]; then
-        log "❌ Resources file not found: $RESOURCES_FILE"
+        log "FAIL: Resources file not found: $RESOURCES_FILE"
         exit 1
     fi
 
     while IFS='|' read -r id type name ip flags; do
-        # Skip comments and blank lines
         [[ "$id" =~ ^#.*$ ]] && continue
         [[ -z "$id" ]] && continue
 
-        # Trim whitespace
         id=$(echo "$id" | xargs)
         type=$(echo "$type" | xargs)
         name=$(echo "$name" | xargs)
         ip=$(echo "$ip" | xargs)
         flags=$(echo "$flags" | xargs)
 
-        # Check for skip flag
         if echo "$flags" | grep -qw "skip"; then
-            log "⏭️  $name ($id): skipped (flagged 'skip' in config)"
+            log "SKIP: $name ($id) -- flagged 'skip' in config"
             ((SKIPPED++))
             ((TOTAL++))
             continue
@@ -477,19 +566,16 @@ main() {
 
         ((TOTAL++))
 
-        # ── Pre-hook ──
         run_hooks "pre" "$id" "$name" "$type"
 
-        # ── apt update ──
         if echo "$flags" | grep -qw "apt"; then
             case "$type" in
                 lxc) run_apt_lxc "$id" "$name" ;;
                 vm)  run_apt_vm  "$id" "$name" "$ip" ;;
-                *)   log "⚠️  $name ($id): unknown type '$type'" ;;
+                *)   log "WARN: $name ($id) -- unknown type '$type'" ;;
             esac
         fi
 
-        # ── Docker update ──
         if echo "$flags" | grep -qw "docker"; then
             case "$type" in
                 lxc) run_docker_lxc "$id" "$name" ;;
@@ -497,31 +583,27 @@ main() {
             esac
         fi
 
-        # ── Post-hook ──
         run_hooks "post" "$id" "$name" "$type"
 
     done < "$RESOURCES_FILE"
 
-    # ── PVE host ──
     if [ "$UPDATE_PVE_HOST" = true ]; then
         update_pve_host
     else
         PVE_STATUS="skipped (disabled in settings)"
-        log "🖥️  PVE host: update skipped (disabled in settings.conf)"
+        log "PVE: update skipped (disabled in settings.conf)"
     fi
 
-    # ── Summary ──
     log ""
     log "════════════════════════════════════════════════════"
     log "  SUMMARY"
-    log "  Total: $TOTAL  |  ✅ $SUCCESS  |  ❌ $FAILED  |  ⏭️ $SKIPPED"
+    log "  Total: $TOTAL  |  OK: $SUCCESS  |  Failed: $FAILED  |  Skipped: $SKIPPED"
     [ ${#REBOOT_LIST[@]} -gt 0 ] && log "  Reboots pending: $(IFS=', '; echo "${REBOOT_LIST[*]}")"
     [ ${#FAIL_LIST[@]} -gt 0 ]   && log "  Failures: $(IFS=', '; echo "${FAIL_LIST[*]}")"
     log "  PVE host: $PVE_STATUS"
     log "  Log: $LOG_FILE"
     log "════════════════════════════════════════════════════"
 
-    # ── Send notification ──
     send_ntfy
 
     log "Done."
