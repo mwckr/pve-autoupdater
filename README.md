@@ -1,97 +1,90 @@
-# PVE Updater
+# PVE Autoupdater
 
 Automated update script for Proxmox LXC containers and QEMU VMs. Updates system packages via `apt`, Docker Compose stacks, and the PVE host itself. Sends a summary notification via ntfy.
 
 ## How It Works
 
-- **LXC containers** are updated via `pct exec` — no SSH, no keys, direct host-level access
+- **LXC containers** are updated via `pct exec` — no SSH needed, direct host-level access
 - **QEMU VMs** are updated via SSH (key-based auth)
-- **Docker stacks** are auto-discovered by searching for `compose.yml` / `docker-compose.yml` files
+- **Docker stacks** are auto-discovered by searching for `compose.yml` / `docker-compose.yml`
 - **Stopped resources** are automatically skipped at runtime
-- **PVE host** is updated last (reboot is never automatic)
+- **PVE host** gets `apt upgrade` but never an automatic reboot
 - A single **ntfy notification** summarizes everything when done
 
-## Quick Setup (5 minutes)
+## Setup
 
-### 1. Copy files to PVE host
-
-From your local machine (or any machine with the files):
-
-```bash
-scp -r pve-updater/ root@<PVE-IP>:/root/pve-updater/
-```
-
-### 2. Make scripts executable
+### 1. Clone onto the PVE host
 
 ```bash
 ssh root@<PVE-IP>
-cd /root/pve-updater
+cd /root
+git clone git@github.com:mwckr/pve-autoupdater.git
+cd pve-autoupdater
 chmod +x pve-updater.sh setup-ssh.sh
 ```
 
-### 3. Edit settings.conf
+### 2. Create your settings file
 
-Open `settings.conf` and verify the ntfy URL, topic, and token are correct.
+```bash
+cp settings.conf.example settings.conf
+nano settings.conf
+```
 
-### 4. Set up SSH for QEMU VMs
+Fill in your ntfy URL, topic, and bearer token. This file is gitignored — your secrets stay local.
+
+### 3. Set up SSH for QEMU VMs
 
 ```bash
 ./setup-ssh.sh 192.168.1.XX 192.168.1.YY
 ```
 
-Replace with the actual IPs of your VMs (webserver-deb and unifios). You'll be prompted for each VM's root password once.
+Replace with the actual IPs of webserver-deb and unifios. You'll be prompted for the root password once per VM.
 
-### 5. Update resources.conf
+### 4. Update resources.conf
 
-Open `resources.conf` and replace `CHANGE_ME` with the actual IP addresses of your VMs:
+Replace the `CHANGE_ME` entries with your VM IPs. Review the full list — if any container also runs Docker stacks that aren't marked, add `,docker` to their flags.
 
-```
-123|vm|webserver-deb|192.168.1.50|apt
-124|vm|unifios|192.168.1.60|apt
-```
-
-### 6. Test with a dry run
+### 5. Test
 
 ```bash
-./pve-updater.sh --dry-run
+./pve-updater.sh --dry-run   # Preview what would happen
+./pve-updater.sh              # Run for real
 ```
 
-This shows what the script *would* do without making any changes.
-
-### 7. Run it for real
-
-```bash
-./pve-updater.sh
-```
-
-### 8. Set up the cron job
+### 6. Schedule via cron
 
 ```bash
 crontab -e
 ```
 
-Add one of these (pick your preferred schedule):
-
 ```cron
 # Every Sunday at 3:00 AM
-0 3 * * 0 /root/pve-updater/pve-updater.sh >> /root/pve-updater/logs/cron.log 2>&1
-
-# Every Saturday at 4:00 AM
-0 4 * * 6 /root/pve-updater/pve-updater.sh >> /root/pve-updater/logs/cron.log 2>&1
+0 3 * * 0 /root/pve-autoupdater/pve-updater.sh >> /root/pve-autoupdater/logs/cron.log 2>&1
 ```
+
+### Updating the script
+
+When you push changes to GitHub:
+
+```bash
+cd /root/pve-autoupdater && git pull
+```
+
+Your `settings.conf` is gitignored, so pulls never overwrite your secrets.
 
 ## File Structure
 
 ```
-/root/pve-updater/
-├── pve-updater.sh      Main script (run this)
-├── settings.conf       ntfy credentials, timeouts, toggles
-├── resources.conf      List of resources to update
-├── setup-ssh.sh        One-time SSH key setup for VMs
-├── hooks/              Custom pre/post scripts per resource
-│   └── README          Explains the hook naming convention
-└── logs/               Auto-created, auto-cleaned
-    └── update-*.log    One log file per run
+pve-autoupdater/
+├── pve-updater.sh          Main script
+├── settings.conf.example   Template (committed) — copy to settings.conf
+├── settings.conf           Your secrets (gitignored, local only)
+├── resources.conf          List of resources to update
+├── setup-ssh.sh            One-time SSH key setup for VMs
+├── hooks/                  Custom pre/post scripts per resource
+│   └── README
+├── logs/                   Auto-created, auto-cleaned (gitignored)
+└── .gitignore
 ```
 
 ## Managing Resources
@@ -106,29 +99,32 @@ Add one of these (pick your preferred schedule):
 131|lxc|my-docker-app||apt,docker
 ```
 
-**Temporarily disable a resource:**
+**Temporarily disable:**
 ```
 130|lxc|my-new-service||skip
 ```
 
 **Add a new VM:**
-1. Run `./setup-ssh.sh <VM-IP>` to copy the SSH key
-2. Add to resources.conf: `130|vm|my-vm|192.168.1.70|apt`
+1. Run `./setup-ssh.sh <VM-IP>`
+2. Add: `130|vm|my-vm|192.168.1.70|apt`
 
 ## Custom Hooks
 
-For resources that need special handling (restart a service, run a specific update command), create hook scripts in the `hooks/` directory:
+For resources needing special handling, drop scripts into `hooks/`:
 
 ```bash
-# Example: hooks/108-post.sh (runs after Plex is updated)
+# hooks/108-post.sh — restart Plex after upgrade
 systemctl restart plexmediaserver
 ```
 
-See `hooks/README` for details.
+```bash
+# hooks/119-post.sh — update n8n after apt
+cd /opt/n8n && npm update -g n8n
+```
 
-## Notification Format
+See `hooks/README` for naming conventions.
 
-You'll get an ntfy notification like this after each run:
+## Notification Example
 
 ```
 ✅ Proxmox Updates Complete
@@ -141,29 +137,22 @@ Updated: 18 / 20  •  Skipped: 2
 ⏱️ Duration: 8m 42s
 ```
 
-If any resource fails, the notification priority is raised to high so it stands out.
+Priority is raised to high if anything fails.
 
-## Logs
+## CLI Options
 
-Each run creates a timestamped log in `logs/`. Logs older than 30 days are auto-deleted (configurable in `settings.conf`).
-
-View the latest log:
 ```bash
-ls -t /root/pve-updater/logs/ | head -1 | xargs -I{} cat /root/pve-updater/logs/{}
+./pve-updater.sh              # Normal run
+./pve-updater.sh --dry-run    # Preview only, no changes
+./pve-updater.sh --force      # Run even if a previous run left a stale lock
 ```
 
 ## Troubleshooting
 
-**"Another instance is running"** — A previous run didn't finish cleanly. Use `--force`:
-```bash
-./pve-updater.sh --force
-```
+**"settings.conf not found"** — Run `cp settings.conf.example settings.conf` and fill in your values.
 
-**VM shows "SSH connection failed"** — Verify key auth works:
-```bash
-ssh -o BatchMode=yes root@<VM-IP> "echo ok"
-```
+**"Another instance is running"** — A previous run didn't finish cleanly. Use `--force`.
 
-**A container fails with apt errors** — Check the log file for details. Common causes: broken packages, full disk, expired repo keys. Fix manually, then the next run will succeed.
+**VM shows "SSH connection failed"** — Verify: `ssh -o BatchMode=yes root@<VM-IP> "echo ok"`
 
-**Docker stacks not found** — The script searches `/opt`, `/root`, `/home`, `/srv`, and `/data` (up to 5 levels deep). If your compose files are elsewhere, create a post-hook that handles it.
+**Docker stacks not found** — The script searches `/opt /root /home /srv /data` up to 5 levels deep. For other paths, use a post-hook.

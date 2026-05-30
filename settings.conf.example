@@ -1,0 +1,21 @@
+# ═══════════════════════════════════════════════════════════════════════
+# pve-updater — settings.conf
+# ═══════════════════════════════════════════════════════════════════════
+# Copy this file:   cp settings.conf.example settings.conf
+# Then fill in your real values. settings.conf is gitignored.
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── ntfy notification settings ──
+NTFY_URL="http://YOUR_NTFY_IP"
+NTFY_TOPIC="alerts"
+NTFY_TOKEN="YOUR_NTFY_TOKEN"
+
+# ── Timeouts (seconds) ──
+APT_TIMEOUT=600          # 10 min per resource for apt operations
+DOCKER_TIMEOUT=300       # 5 min for docker compose pull/up
+
+# ── PVE host ──
+UPDATE_PVE_HOST=true     # Set to false to skip updating the PVE host itself
+
+# ── Log retention ──
+LOG_RETENTION_DAYS=30    # Delete logs older than this

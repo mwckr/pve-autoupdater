@@ -1,0 +1,10 @@
+# Secrets — never commit
+settings.conf
+
+# Runtime files
+logs/
+*.lock
+
+# OS junk
+.DS_Store
+Thumbs.db

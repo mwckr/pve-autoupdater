@@ -27,6 +27,15 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="$LOG_DIR/update-$TIMESTAMP.log"
 
 # ── Load settings ──
+if [ ! -f "$SCRIPT_DIR/settings.conf" ]; then
+    echo "❌ settings.conf not found."
+    echo "   First run? Copy the example and fill in your values:"
+    echo ""
+    echo "   cp $SCRIPT_DIR/settings.conf.example $SCRIPT_DIR/settings.conf"
+    echo "   nano $SCRIPT_DIR/settings.conf"
+    echo ""
+    exit 1
+fi
 source "$SCRIPT_DIR/settings.conf"
 
 # ── CLI flags ──
