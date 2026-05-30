@@ -78,7 +78,13 @@ declare -a REBOOT_LIST=()
 declare -a DOCKER_LIST=()
 declare -a FAIL_LIST=()
 PVE_STATUS=""
+APP_STATUS=""
 START_TIME=$(date +%s)
+
+# ── Defaults for optional settings (safe for upgrades from older configs) ──
+UPDATE_APPS="${UPDATE_APPS:-false}"
+APP_UPDATE_BACKUP="${APP_UPDATE_BACKUP:-no}"
+APP_UPDATE_REBOOT="${APP_UPDATE_REBOOT:-no}"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
@@ -469,6 +475,45 @@ update_pve_host() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
+# Community-scripts app updates
+# ═══════════════════════════════════════════════════════════════════════
+
+run_app_updates() {
+    log "APPS: running community-scripts update-apps.sh"
+
+    if [ "$DRY_RUN" = true ]; then
+        log "DRY-RUN: would run update-apps.sh for all tagged containers"
+        APP_STATUS="dry-run"
+        return 0
+    fi
+
+    local app_log="$LOG_DIR/app-update-$TIMESTAMP.log"
+    local rc
+
+    var_backup="$APP_UPDATE_BACKUP" \
+    var_container=all_running \
+    var_unattended=yes \
+    var_skip_confirm=yes \
+    var_auto_reboot="$APP_UPDATE_REBOOT" \
+    bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/tools/pve/update-apps.sh)" \
+        > "$app_log" 2>&1
+    rc=$?
+
+    # Strip ANSI escape codes for clean log output
+    sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$app_log" 2>/dev/null
+
+    if [ $rc -eq 0 ]; then
+        APP_STATUS="completed"
+        log "APPS: update-apps.sh finished successfully (see $app_log)"
+    else
+        APP_STATUS="failed (exit $rc)"
+        FAIL_LIST+=("app-updates [exit $rc]")
+        ((FAILED++))
+        log "FAIL: update-apps.sh exited with code $rc (see $app_log)"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
 # Notification
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -509,6 +554,11 @@ send_ntfy() {
     fi
 
     msg+=$'\n'"PVE host: $PVE_STATUS"
+
+    if [ -n "$APP_STATUS" ]; then
+        msg+=$'\n'"App updates: $APP_STATUS"
+    fi
+
     msg+=$'\n'"Duration: ${minutes}m ${seconds}s"
 
     curl -s --max-time 15 \
@@ -587,6 +637,14 @@ main() {
 
     done < "$RESOURCES_FILE"
 
+    # ── Community-scripts app updates ──
+    if [ "$UPDATE_APPS" = true ]; then
+        run_app_updates
+    else
+        APP_STATUS=""
+    fi
+
+    # ── PVE host ──
     if [ "$UPDATE_PVE_HOST" = true ]; then
         update_pve_host
     else
@@ -600,6 +658,7 @@ main() {
     log "  Total: $TOTAL  |  OK: $SUCCESS  |  Failed: $FAILED  |  Skipped: $SKIPPED"
     [ ${#REBOOT_LIST[@]} -gt 0 ] && log "  Reboots pending: $(IFS=', '; echo "${REBOOT_LIST[*]}")"
     [ ${#FAIL_LIST[@]} -gt 0 ]   && log "  Failures: $(IFS=', '; echo "${FAIL_LIST[*]}")"
+    [ -n "$APP_STATUS" ]         && log "  App updates: $APP_STATUS"
     log "  PVE host: $PVE_STATUS"
     log "  Log: $LOG_FILE"
     log "════════════════════════════════════════════════════"

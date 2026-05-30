@@ -17,5 +17,12 @@ DOCKER_TIMEOUT=300       # 5 min for docker compose pull/up
 # ── PVE host ──
 UPDATE_PVE_HOST=true     # Set to false to skip updating the PVE host itself
 
+# ── Community-scripts app updates ──
+# Runs update-apps.sh after OS updates to update services (karakeep, plex, etc.)
+# Requires LXC containers to have the 'community-script' tag.
+UPDATE_APPS=true         # Set to false to skip app updates entirely
+APP_UPDATE_BACKUP=no     # 'yes' to vzdump before each app update, 'no' to skip
+APP_UPDATE_REBOOT=no     # 'yes' to auto-reboot containers that need it
+
 # ── Log retention ──
 LOG_RETENTION_DAYS=30    # Delete logs older than this
