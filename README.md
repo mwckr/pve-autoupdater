@@ -1,15 +1,31 @@
 # PVE Autoupdater
 
-Automated update script for Proxmox LXC containers and QEMU VMs. Updates system packages via `apt`, Docker Compose stacks, and the PVE host itself. Sends a summary notification via ntfy.
+Unattended weekly updates for a Proxmox VE node: every LXC container, every VM, the Docker Compose stacks inside them, community-scripts apps, and the PVE host itself. One ntfy notification when it is done, and one if the run aborts.
 
-## How It Works
+There is **no inventory to maintain**. Guests are discovered from Proxmox on every run, so creating, cloning, renaming or deleting a container is picked up automatically. Exceptions are expressed as Proxmox tags.
 
-- **LXC containers** are updated via `pct exec` — no SSH needed, direct host-level access
-- **QEMU VMs** are updated via SSH (key-based auth)
-- **Docker stacks** are auto-discovered by searching for `compose.yml` / `docker-compose.yml`
-- **Stopped resources** are automatically skipped at runtime
-- **PVE host** gets `apt upgrade` but never an automatic reboot
-- A single **ntfy notification** summarizes everything when done
+## What a run does
+
+1. **Discovers** all guests on the node. Templates are ignored, stopped guests are skipped, guests locked by a running backup are retried at the end of the run.
+2. For every running guest (unless tagged otherwise):
+   - takes a **snapshot** `autoupd-<timestamp>` — rolling, the newest 2 are kept, older ones are deleted
+   - runs `hooks/<ID>-pre.sh` if present (a failing pre-hook stops the update of that guest)
+   - updates **OS packages**: Debian/Ubuntu via `apt-get upgrade --with-new-pkgs` (plus `autoremove`), Alpine via `apk upgrade`. Guests without a supported package manager are left alone.
+   - updates **Docker Compose stacks** if Docker is installed. Only stacks that are currently running are considered, and only services whose image actually changed are recreated. Stopped stacks or services are never started.
+   - runs `hooks/<ID>-post.sh` if present
+   - checks the guest is **still running** (and starts it again if not)
+   - records whether a **reboot is pending**; reboots only if you enable it
+3. Runs the community-scripts **`update-apps.sh`** for containers tagged `community-script` that updated successfully (optional).
+4. Updates the **PVE host** with `apt-get dist-upgrade`, which is what Proxmox recommends and what the GUI's Upgrade button runs. It refuses to continue if the upgrade would remove core Proxmox packages, waits for a running vzdump to finish, and never reboots the host.
+5. Sends the **ntfy summary**. The exit code is non-zero if anything failed.
+
+### VMs
+
+VMs are updated through the **QEMU guest agent** when it is installed (`qm guest exec`): no SSH, no IP addresses, nothing to configure. Inside the VM run `apt install qemu-guest-agent`, then enable *QEMU Guest Agent* under the VM's Options in the GUI.
+
+Without an agent, or when the agent has exec disabled, the script falls back to **SSH as root**. It takes the IP from the agent or from `overrides.conf` and needs key auth, which `./setup-ssh.sh <VMID or IP>` sets up once.
+
+VMs whose OS is not apt based (Home Assistant OS, Windows, UniFi appliances, …) are skipped automatically, with the reason in the notification. Tag them `no-update` to silence that.
 
 ## Setup
 
@@ -30,28 +46,23 @@ cp settings.conf.example settings.conf
 nano settings.conf
 ```
 
-Fill in your ntfy URL, topic, and bearer token. This file is gitignored — your secrets stay local.
+Fill in the ntfy URL, topic and token. Everything else has sensible defaults and is documented in the example file. `settings.conf` is gitignored, so pulls never overwrite it.
 
-### 3. Set up SSH for QEMU VMs
-
-```bash
-./setup-ssh.sh 192.168.1.XX 192.168.1.YY
-```
-
-Replace with the actual IPs of webserver-deb and unifios. You'll be prompted for the root password once per VM.
-
-### 4. Update resources.conf
-
-Replace the `CHANGE_ME` entries with your VM IPs. Review the full list — if any container also runs Docker stacks that aren't marked, add `,docker` to their flags.
-
-### 5. Test
+### 3. Look at the plan
 
 ```bash
-./pve-updater.sh --dry-run   # Preview what would happen
-./pve-updater.sh              # Run for real
+./pve-updater.sh --list
 ```
 
-### 6. Schedule via cron
+This prints every guest with what the script would do to it, including how each VM will be reached. Fix anything you don't like with tags (next section), then:
+
+```bash
+./pve-updater.sh --dry-run        # probes every guest, changes nothing, sends a test notification
+./pve-updater.sh --only 103       # real run for a single guest
+./pve-updater.sh                  # full run
+```
+
+### 4. Schedule via cron
 
 ```bash
 crontab -e
@@ -62,97 +73,136 @@ crontab -e
 0 3 * * 0 /root/pve-autoupdater/pve-updater.sh >> /root/pve-autoupdater/logs/cron.log 2>&1
 ```
 
-### Updating the script
+Pick a time that does not overlap your backup job. If it does, the script copes (locked guests are retried, the host update waits), but the run takes longer.
 
-When you push changes to GitHub:
+## Controlling guests
+
+Set these **tags** on a guest in the GUI (select the guest → Tags). Changes take effect on the next run.
+
+| Tag           | Effect                                   |
+|---------------|------------------------------------------|
+| `no-update`   | never touch this guest                   |
+| `no-apt`      | skip OS package updates                  |
+| `no-docker`   | skip Docker stack updates                |
+| `no-snapshot` | don't snapshot before updating           |
+
+The same keywords can go into `overrides.conf` (`<ID>|keyword,keyword`), which is also where a VM without guest agent gets its SSH address: `124|ip=192.168.1.1`. See the comments in that file.
+
+Stopped guests are skipped automatically, so there is no need to tag something you shut down.
+
+## Safety net
+
+- **Snapshots.** Every guest is snapshotted right before it is touched. To undo a bad update:
+  ```bash
+  pct listsnapshot 104
+  pct rollback 104 autoupd-20261025-030001          # LXC
+  qm  rollback 123 autoupd-20261025-030001 --start 1 # VM
+  ```
+  The notification includes the exact rollback command for every failed guest. Snapshots need storage that supports them (LVM-thin, ZFS, qcow2 on a directory). On storage that doesn't (raw files on NFS), the snapshot fails, a warning is reported, and the update proceeds; set `SNAPSHOT_REQUIRED=true` to make it skip such guests instead. Bind mounts are never part of a snapshot.
+- **Low disk guard.** A guest with less than `MIN_FREE_MB` free on `/` is not updated and reported as failed. Same for the host with `HOST_MIN_FREE_MB`.
+- **Core package guard.** The host upgrade is simulated first. If it would remove `proxmox-ve`, `pve-manager`, `qemu-server`, `pve-container` or similar (the classic broken-repo failure), nothing is installed and you get a notification.
+- **Partial repo failures don't block security updates.** If `apt-get update` reports errors (an expired third-party key, the enterprise repo without a subscription), the upgrade still runs with what could be fetched and the guest is listed under *Warnings* until you fix the repo.
+- **Interrupted dpkg runs heal themselves.** `dpkg --configure -a` runs before every upgrade.
+- **Locking and watchdog.** Only one instance can run (kernel `flock`, so stale locks cannot happen). A run that exceeds `MAX_RUNTIME` is aborted. Every external command has a timeout.
+- **Abort notification.** If the script dies for any reason before the summary, a high-priority *ABORTED* notification with the last log lines is sent, so a silent broken cron job is not possible.
+- **No automatic reboots** unless you set `AUTO_REBOOT_LXC` / `AUTO_REBOOT_VM`. Pending reboots are listed in every notification until done. The host is never rebooted.
+- **Services restart automatically** after library updates when `needrestart` is installed in a guest (`apt install needrestart`); the script runs apt with `NEEDRESTART_MODE=a`.
+
+## Hooks
+
+Drop scripts into `hooks/` to run inside a guest before or after its update, for example to stop and start a service or run a custom updater:
+
+```bash
+# hooks/108-pre.sh
+systemctl stop plexmediaserver
+# hooks/108-post.sh
+systemctl start plexmediaserver
+```
+
+Hooks work for containers and VMs, must be root-owned and not group/world-writable. See `hooks/README`.
+
+## Notification example
+
+```
+⚠️ Proxmox Updates -- 2 Failed
+
+Updated: 17 / 29 (62 pkgs)  |  Skipped: 9
+Failed: isponsorblocktv (104): apt upgrade rc 100 [rollback: pct rollback 104 autoupd-20261025-030001]; pairdrop (109): low disk (120 MB free)
+Warnings: debian (112): apt update errors
+Reboot pending: adguard (103), webserver-deb (123), PVE host
+Docker updated: komodo-docker (127): 1/3
+Skipped: 4 stopped; haos (113): unsupported OS 'haos' (tag no-update to silence)
+App updates: 5 OK
+PVE host: 5 upgraded
+Duration: 8m 42s
+```
+
+Priority is raised when anything fails. An aborted run sends a separate *ABORTED* message at the highest priority.
+
+## CLI
+
+```bash
+./pve-updater.sh                  # normal run (what cron calls)
+./pve-updater.sh --list           # discovered inventory and plan, nothing else
+./pve-updater.sh --dry-run        # probe every guest, change nothing
+./pve-updater.sh --only 101,123   # restrict to these guest IDs
+./pve-updater.sh --no-host        # skip the PVE host update
+./pve-updater.sh --no-ntfy        # don't notify
+```
+
+Logs: `logs/latest.log` points at the current run, `logs/update-*.log` hold the per-run detail (including apt and docker output per guest), `logs/app-update-*.log` the community-scripts output. Old logs are deleted after `LOG_RETENTION_DAYS`.
+
+## Troubleshooting
+
+**"another instance is running"** — a run is still going (`ps aux | grep pve-updater`). The lock disappears the moment the process ends, there is nothing to clean up.
+
+**VM: "no guest agent and no ip=…"** — install `qemu-guest-agent` in the VM and enable it in the VM options, or add `<VMID>|ip=<address>` to `overrides.conf` and run `./setup-ssh.sh <VMID>`.
+
+**VM: "SSH key not installed"** — `./setup-ssh.sh <VMID>`. Verify with `ssh -o BatchMode=yes root@<IP> echo ok`.
+
+**VM: "unsupported OS"** — the guest is not apt based. Tag it `no-update`.
+
+**Docker stacks not updated** — only stacks with running containers whose compose file still exists at the path Docker recorded are handled. Containers started with plain `docker run` are not managed; use a post-hook or Watchtower for those. Look at the run log for the per-stack detail.
+
+**"would remove core packages"** — run `apt-get -s dist-upgrade` on the host and check your repositories; this is almost always a wrong or missing repo entry.
+
+**A guest broke after an update** — roll back (see *Safety net*), then tag it `no-update` until you have looked into it.
+
+## Updating the script
 
 ```bash
 cd /root/pve-autoupdater && git pull
 ```
 
-Your `settings.conf` is gitignored, so pulls never overwrite your secrets.
+`settings.conf` is gitignored, your settings stay. New settings get defaults automatically; see `settings.conf.example` for what is available.
 
-## File Structure
+## Security notes
+
+- `settings.conf` holds your ntfy token. Keep it out of git (it is in `.gitignore`).
+- With `UPDATE_APPS=true`, `update-apps.sh` is downloaded from the community-scripts GitHub repository on every run and executed as root on the host. The download is checked to be a shell script and runs under a timeout, but you are trusting that repository. Set `UPDATE_APPS=false` if you don't want that, or point `APP_UPDATE_URL` at a pinned commit or your own fork.
+- Hooks run as root inside guests; the script refuses hooks that are not root-owned or are writable by others.
+
+## Testing without a PVE host
+
+`tests/mock/` contains a fake Proxmox environment (`pct`, `qm`, `pvesh`, `ssh`, `apt-get`, `docker`, `curl` are all shell fakes with failure injections: a failing apt upgrade, a full disk, a locked guest, a VM without agent, a Docker stack whose pull fails, …). It lets you exercise the whole control flow on any machine with bash, including Git Bash on Windows:
+
+```bash
+bash tests/mock/make-harness.sh      # generate the fakes
+bash tests/mock/run-test.sh --list   # then --dry-run, or a full run
+```
+
+Nothing in it touches a real system.
+
+## File structure
 
 ```
 pve-autoupdater/
 ├── pve-updater.sh          Main script
 ├── settings.conf.example   Template (committed) — copy to settings.conf
-├── settings.conf           Your secrets (gitignored, local only)
-├── resources.conf          List of resources to update
-├── setup-ssh.sh            One-time SSH key setup for VMs
-├── hooks/                  Custom pre/post scripts per resource
-│   └── README
+├── settings.conf           Your settings (gitignored)
+├── overrides.conf          Optional per-guest exceptions (tags are usually easier)
+├── setup-ssh.sh            SSH key setup for VMs without guest agent
+├── hooks/                  Custom pre/post scripts per guest
 ├── logs/                   Auto-created, auto-cleaned (gitignored)
-└── .gitignore
+└── tests/mock/             Fake Proxmox environment for testing the script
 ```
-
-## Managing Resources
-
-**Add a new LXC container:**
-```
-130|lxc|my-new-service||apt
-```
-
-**Add one with Docker:**
-```
-131|lxc|my-docker-app||apt,docker
-```
-
-**Temporarily disable:**
-```
-130|lxc|my-new-service||skip
-```
-
-**Add a new VM:**
-1. Run `./setup-ssh.sh <VM-IP>`
-2. Add: `130|vm|my-vm|192.168.1.70|apt`
-
-## Custom Hooks
-
-For resources needing special handling, drop scripts into `hooks/`:
-
-```bash
-# hooks/108-post.sh — restart Plex after upgrade
-systemctl restart plexmediaserver
-```
-
-```bash
-# hooks/119-post.sh — update n8n after apt
-cd /opt/n8n && npm update -g n8n
-```
-
-See `hooks/README` for naming conventions.
-
-## Notification Example
-
-```
-✅ Proxmox Updates Complete
-
-Updated: 18 / 20  •  Skipped: 2
-❌ Failed: karakeep (102)
-🔄 Reboot pending: adguard (103), debian (112), PVE host
-🐳 Docker updated: dockge (116), komodo-docker (127)
-🖥️ PVE host: 5 upgraded — ⚠️ REBOOT PENDING
-⏱️ Duration: 8m 42s
-```
-
-Priority is raised to high if anything fails.
-
-## CLI Options
-
-```bash
-./pve-updater.sh              # Normal run
-./pve-updater.sh --dry-run    # Preview only, no changes
-./pve-updater.sh --force      # Run even if a previous run left a stale lock
-```
-
-## Troubleshooting
-
-**"settings.conf not found"** — Run `cp settings.conf.example settings.conf` and fill in your values.
-
-**"Another instance is running"** — A previous run didn't finish cleanly. Use `--force`.
-
-**VM shows "SSH connection failed"** — Verify: `ssh -o BatchMode=yes root@<VM-IP> "echo ok"`
-
-**Docker stacks not found** — The script searches `/opt /root /home /srv /data` up to 5 levels deep. For other paths, use a post-hook.

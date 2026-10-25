@@ -1,15 +1,29 @@
 # Hooks Directory
 
-Place custom scripts here to run before or after a resource is updated.
+Place small scripts here to run inside a guest before or after it is updated.
+Works for LXC containers and for VMs (via the guest agent or SSH, whichever
+pve-updater uses for that VM).
 
 ## Naming Convention
 
-    <CTID>-pre.sh     Runs INSIDE the container BEFORE apt/docker updates
-    <CTID>-post.sh    Runs INSIDE the container AFTER apt/docker updates
+    <ID>-pre.sh      Runs INSIDE the guest BEFORE snapshot-less steps: apt/docker updates
+    <ID>-post.sh     Runs INSIDE the guest AFTER apt/docker updates
+
+The ID is the CTID / VMID shown in the Proxmox GUI.
+
+## Semantics
+
+- Hooks run with `sh` inside the guest (write POSIX sh; bash is not guaranteed,
+  e.g. in Alpine containers).
+- A **pre-hook that exits non-zero aborts the update of that guest** and it is
+  reported as failed. Use this deliberately: if "stop my service" fails you
+  usually don't want the upgrade to continue.
+- A **post-hook that exits non-zero is only a warning** in the notification.
+- Hook output goes to the run log in logs/.
 
 ## Examples
 
-Stop a service before upgrading, restart after:
+Stop a service before upgrading, start it after:
 
     # File: 108-pre.sh
     systemctl stop plexmediaserver
@@ -24,10 +38,8 @@ Run a custom update command for a service:
 
 ## Security
 
-Hook files must be owned by root and must NOT be group- or world-writable.
-The script will skip any hook that fails this check and log a warning.
+Hook files must be owned by root and must NOT be group- or world-writable,
+otherwise they are skipped with a warning:
 
     chown root:root hooks/*.sh
     chmod 700 hooks/*.sh
-
-Note: Hooks currently only work for LXC containers (executed via pct exec).

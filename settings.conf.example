@@ -3,26 +3,48 @@
 # ═══════════════════════════════════════════════════════════════════════
 # Copy this file:   cp settings.conf.example settings.conf
 # Then fill in your real values. settings.conf is gitignored.
+#
+# Every setting below is optional except the ntfy block — anything you
+# leave out falls back to the default shown here.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ── ntfy notification settings ──
-NTFY_URL="http://YOUR_NTFY_IP"
+# ── ntfy notification ──
+NTFY_URL="http://YOUR_NTFY_IP"   # leave empty ("") to disable notifications
 NTFY_TOPIC="alerts"
-NTFY_TOKEN="YOUR_NTFY_TOKEN"
+NTFY_TOKEN="YOUR_NTFY_TOKEN"     # leave empty if the topic needs no auth
 
 # ── Timeouts (seconds) ──
-APT_TIMEOUT=600          # 10 min per resource for apt operations
-DOCKER_TIMEOUT=300       # 5 min for docker compose pull/up
+APT_TIMEOUT=900          # per guest, for package updates (also used for hooks)
+DOCKER_TIMEOUT=600       # per guest, for all docker compose pull/up work
+MAX_RUNTIME=14400        # abort the whole run after this long (0 = no limit)
+BACKUP_WAIT_MAX=1800     # wait this long for a running vzdump before updating the host
 
-# ── PVE host ──
-UPDATE_PVE_HOST=true     # Set to false to skip updating the PVE host itself
+# ── Safety ──
+SNAPSHOT_BEFORE_UPDATE=true   # snapshot every guest before touching it (LVM-thin/ZFS: instant)
+SNAPSHOT_KEEP=2               # keep this many autoupd-* snapshots per guest, delete older ones
+SNAPSHOT_REQUIRED=false       # true: do NOT update a guest whose snapshot failed
+MIN_FREE_MB=500               # refuse to update a guest with less free space on /
+HOST_MIN_FREE_MB=2048         # same for the PVE host
+
+# ── What to update ──
+UPDATE_PVE_HOST=true     # apt dist-upgrade on the PVE host itself (never reboots it)
+UPDATE_DOCKER=true       # update running Docker Compose stacks in guests that have Docker
+APT_AUTOREMOVE=true      # apt-get autoremove after a successful upgrade (old kernels etc.)
+AUTO_REBOOT_LXC=false    # reboot containers that report a pending reboot (seconds of downtime)
+AUTO_REBOOT_VM=false     # reboot VMs that report a pending reboot (new kernel)
+
+# ── VMs ──
+VM_EXEC_METHOD=auto      # auto: QEMU guest agent if available, else SSH | agent | ssh
+VM_SSH_USER=root         # SSH user for the fallback (see setup-ssh.sh)
+VM_IP_PREFIX=""          # e.g. "192.168.1." — prefer this subnet when a VM reports several IPs
 
 # ── Community-scripts app updates ──
-# Runs update-apps.sh after OS updates to update services (karakeep, plex, etc.)
-# Requires LXC containers to have the 'community-script' tag.
-UPDATE_APPS=true         # Set to false to skip app updates entirely
-APP_UPDATE_BACKUP=no     # 'yes' to vzdump before each app update, 'no' to skip
-APP_UPDATE_REBOOT=no     # 'yes' to auto-reboot containers that need it
+# Runs update-apps.sh after the OS updates to update the services themselves
+# (karakeep, jellyfin, …). Only containers tagged 'community-script' are touched.
+UPDATE_APPS=true         # false to skip app updates entirely
+APP_UPDATE_BACKUP=no     # 'yes' to vzdump before each app update (slow; snapshots cover this)
+APP_UPDATE_REBOOT=no     # 'yes' to let update-apps.sh reboot containers that need it
+APP_UPDATE_TIMEOUT=3600  # abort update-apps.sh after this many seconds
 
-# ── Log retention ──
-LOG_RETENTION_DAYS=30    # Delete logs older than this
+# ── Logs ──
+LOG_RETENTION_DAYS=30    # delete logs older than this
