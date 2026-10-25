@@ -15,7 +15,7 @@ There is **no inventory to maintain**. Guests are discovered from Proxmox on eve
    - runs `hooks/<ID>-post.sh` if present
    - checks the guest is **still running** (and starts it again if not)
    - records whether a **reboot is pending**; reboots only if you enable it
-3. Runs the community-scripts **`update-apps.sh`** for containers tagged `community-script` that updated successfully (optional).
+3. Runs the community-scripts **`update-apps.sh`** for containers that updated successfully and are either tagged `community-script` or carry the community `/usr/bin/update` tool (optional). Be aware that this phase is by far the slowest part of a run: every app's own updater runs in turn, often re-running apt and downloading the application, so 20 containers can take two to three hours. If that is too long for a weekly window, set `UPDATE_APPS=false` and run `./pve-updater.sh` with apps enabled less often, or keep it and accept the runtime.
 4. Updates the **PVE host** with `apt-get dist-upgrade`, which is what Proxmox recommends and what the GUI's Upgrade button runs. It refuses to continue if the upgrade would remove core Proxmox packages, waits for a running vzdump to finish, and never reboots the host.
 5. Sends the **ntfy summary**. The exit code is non-zero if anything failed.
 
@@ -85,6 +85,7 @@ Set these **tags** on a guest in the GUI (select the guest → Tags). Changes ta
 | `no-apt`      | skip OS package updates                  |
 | `no-docker`   | skip Docker stack updates                |
 | `no-snapshot` | don't snapshot before updating           |
+| `no-apps`     | skip the community-scripts app update    |
 
 The same keywords can go into `overrides.conf` (`<ID>|keyword,keyword`), which is also where a VM without guest agent gets its SSH address: `124|ip=192.168.1.1`. See the comments in that file.
 
@@ -147,6 +148,7 @@ Priority is raised when anything fails. An aborted run sends a separate *ABORTED
 ./pve-updater.sh --dry-run        # probe every guest, change nothing
 ./pve-updater.sh --only 101,123   # restrict to these guest IDs
 ./pve-updater.sh --no-host        # skip the PVE host update
+./pve-updater.sh --no-apps        # skip the community-scripts app update phase
 ./pve-updater.sh --no-ntfy        # don't notify
 ```
 
@@ -156,7 +158,7 @@ Logs: `logs/latest.log` points at the current run, `logs/update-*.log` hold the 
 
 **A manual run looks stuck** — the community app-update phase prints nothing to the console; follow it with `tail -f logs/app-update-*.log`. Ctrl-C stops a run at any point, kills the running command and sends an ABORTED notification. Guest commands and the community script run detached from your terminal, so nothing inside them can grab the console or wait for a keypress.
 
-**"another instance is running"** — a run is still going (`ps aux | grep pve-updater`). The lock disappears the moment the process ends, there is nothing to clean up.
+**"another instance is running"** — a run is still going, or a leftover process from an aborted run still holds the lock. The message lists the holding PIDs and the `kill` command to end them. The lock is released the moment the last holder exits; there is no lock file to delete.
 
 **VM: "no guest agent and no ip=…"** — install `qemu-guest-agent` in the VM and enable it in the VM options, or add `<VMID>|ip=<address>` to `overrides.conf` and run `./setup-ssh.sh <VMID>`.
 
@@ -169,6 +171,8 @@ Logs: `logs/latest.log` points at the current run, `logs/update-*.log` hold the 
 **Docker: "pull failed … toomanyrequests"** — Docker Hub rate-limits anonymous pulls per IP, and a guest with many stacks pulls them all in one burst. Run `docker login` once inside that container; authenticated pulls get a much higher limit.
 
 **"would remove core packages"** — run `apt-get -s dist-upgrade` on the host and check your repositories; this is almost always a wrong or missing repo entry.
+
+**App update "needs a manual run"** — that app's community updater stopped at a question, typically a migration confirmation. The script never answers such questions for you. Run it once by hand, `pct exec <ID> -- update`, read what it asks, and it will be unattended again afterwards. If an updater always asks, tag the container `no-apps`.
 
 **A guest broke after an update** — roll back (see *Safety net*), then tag it `no-update` until you have looked into it.
 

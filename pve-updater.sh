@@ -35,6 +35,7 @@
 #   ./pve-updater.sh --list          Print the discovered inventory and plan
 #   ./pve-updater.sh --only 101,123  Restrict to these guest IDs
 #   ./pve-updater.sh --no-host       Skip the PVE host update
+#   ./pve-updater.sh --no-apps       Skip the community-scripts app update phase
 #   ./pve-updater.sh --no-ntfy       Don't send a notification
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -64,6 +65,7 @@ NODE="$(hostname)"
 DRY_RUN=false
 LIST_ONLY=false
 NO_HOST=false
+NO_APPS=false
 NO_NTFY=false
 ONLY_IDS=""
 
@@ -78,6 +80,7 @@ while [ $# -gt 0 ]; do
         --only)           shift; ONLY_IDS="${1:-}" ;;
         --only=*)         ONLY_IDS="${1#--only=}" ;;
         --no-host|--skip-host) NO_HOST=true ;;
+        --no-apps)        NO_APPS=true ;;
         --no-ntfy)        NO_NTFY=true ;;
         --force)          echo "NOTE: --force is obsolete (locking uses flock, stale locks cannot happen); ignoring." ;;
         -h|--help)        usage; exit 0 ;;
@@ -209,13 +212,38 @@ join_by() {
 # Lock, watchdog, abort handling
 # ═══════════════════════════════════════════════════════════════════════
 
+lock_holders() {
+    if command -v fuser >/dev/null 2>&1; then
+        fuser "$LOCK_FILE" 2>/dev/null | tr -s ' \n' ' '
+        return
+    fi
+    local p fd
+    for p in /proc/[0-9]*; do
+        for fd in "$p"/fd/*; do
+            case "$(readlink "$fd" 2>/dev/null)" in
+                "$LOCK_FILE"*) printf '%s ' "${p#/proc/}"; break ;;
+            esac
+        done
+    done
+}
+
 acquire_lock() {
-    exec 9>"$LOCK_FILE"
+    exec 9>>"$LOCK_FILE"
     if ! flock -n 9; then
-        echo "ERROR: another pve-updater instance is running (lock: $LOCK_FILE)." >&2
+        local holders
+        holders=$(lock_holders)
+        holders="${holders% }"
+        {
+            echo "ERROR: another pve-updater instance is running (lock: $LOCK_FILE)."
+            if [ -n "$holders" ]; then
+                echo "  Held by PID(s): $holders"
+                ps -o pid,etime,cmd -p "${holders// /,}" 2>/dev/null | sed 's/^/    /'
+                echo "  If that run is dead, end its leftovers with:  kill -TERM $holders"
+            fi
+        } >&2
         exit 1
     fi
-    echo $$ >&9
+    echo $$ > "$LOCK_FILE"
 }
 
 start_watchdog() {
@@ -333,7 +361,9 @@ if [ "$UPD_IS_VM" = 1 ]; then
     running=$(uname -r)
     if [ -n "$newest" ] && [ "$newest" != "$running" ]; then reboot=yes; fi
 fi
-echo "##RESULT pm=$pm free_mb=$free_mb update_rc=$update_rc upgrade_rc=$upgrade_rc upgraded=$upgraded newinst=$newinst autoremove_rc=$autoremove_rc reboot=$reboot"
+cs=no
+[ -f /usr/bin/update ] && grep -qi 'community-scripts' /usr/bin/update 2>/dev/null && cs=yes
+echo "##RESULT pm=$pm free_mb=$free_mb update_rc=$update_rc upgrade_rc=$upgrade_rc upgraded=$upgraded newinst=$newinst autoremove_rc=$autoremove_rc reboot=$reboot cs=$cs"
 EOS
 
 read -r -d '' GUEST_DOCKER_SCRIPT <<'EOS' || true
@@ -481,6 +511,7 @@ guest_options() {
             no-apt|noapt)                   opts+=" no-apt" ;;
             no-docker|nodocker)             opts+=" no-docker" ;;
             no-snapshot|nosnapshot)         opts+=" no-snapshot" ;;
+            no-apps|noapps)                 opts+=" no-apps" ;;
         esac
     done
     if [ -f "$OVERRIDES_FILE" ]; then
@@ -493,7 +524,7 @@ guest_options() {
             for t in ${oopts//,/ }; do
                 case "$t" in
                     skip|no-update) opts+=" skip" ;;
-                    no-apt|no-docker|no-snapshot) opts+=" $t" ;;
+                    no-apt|no-docker|no-snapshot|no-apps) opts+=" $t" ;;
                     ip=*) opts+=" $t" ;;
                     *) echo "WARN: overrides.conf: unknown option '$t' for $id (ignored)" >&2 ;;
                 esac
@@ -540,9 +571,11 @@ run_child() {
 }
 kill_child() {
     [ -n "$CHILD_PID" ] || return 0
-    kill -TERM "$CHILD_PID" 2>/dev/null
-    sleep 2
-    kill -KILL "$CHILD_PID" 2>/dev/null
+    # CHILD_PID is a session/group leader (setsid): signal the whole group so that
+    # scripts which trap SIGTERM without exiting (the community updater does) die too.
+    kill -TERM -- "-$CHILD_PID" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null
+    sleep 3
+    kill -KILL -- "-$CHILD_PID" 2>/dev/null || kill -KILL "$CHILD_PID" 2>/dev/null
     CHILD_PID=""
 }
 
@@ -556,11 +589,11 @@ guest_exec() {
     # </dev/null nothing inside a guest may ever wait for keyboard input
     case "$type:${EXEC_METHOD:-}" in
         lxc:*)
-            run_child timeout $((t + 30)) pct exec "$id" -- sh -c "$script" </dev/null >"$GUEST_OUT" 2>&1
+            run_child timeout -k 30 $((t + 30)) pct exec "$id" -- sh -c "$script" </dev/null >"$GUEST_OUT" 2>&1
             ;;
         vm:agent)
             raw=$(mktemp "${TMPDIR:-/tmp}/pve-updater.raw.XXXXXX")
-            run_child timeout $((t + 60)) qm guest exec "$id" --timeout "$t" -- sh -c "$script" </dev/null >"$raw" 2>&1
+            run_child timeout -k 30 $((t + 60)) qm guest exec "$id" --timeout "$t" -- sh -c "$script" </dev/null >"$raw" 2>&1
             rc=$?
             if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
                 echo "qm guest exec terminated (rc $rc)" >"$GUEST_OUT"; rm -f "$raw"; return "$rc"
@@ -573,7 +606,7 @@ guest_exec() {
         vm:ssh)
             raw=$(mktemp "${TMPDIR:-/tmp}/pve-updater.script.XXXXXX")
             printf '%s\n' "$script" >"$raw"
-            run_child timeout $((t + 30)) ssh -o ConnectTimeout=10 -o BatchMode=yes \
+            run_child timeout -k 30 $((t + 30)) ssh -o ConnectTimeout=10 -o BatchMode=yes \
                 -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 \
                 "$VM_SSH_USER@$EXEC_IP" sh -s <"$raw" >"$GUEST_OUT" 2>&1
             rc=$?
@@ -837,12 +870,14 @@ process_guest() {
         local disk_note=" [free ${free_mb} MB]"
         [ "${free_mb:--1}" -ge 0 ] && [ "$free_mb" -lt "$MIN_FREE_MB" ] && disk_note=" [LOW DISK: ${free_mb} MB free < MIN_FREE_MB=$MIN_FREE_MB, would refuse]"
         log "DRY-RUN: $label$via -- would: ${plan%, }$disk_note"
-        [ "$type" = lxc ] && APP_IDS+=("$id")
+        if [ "$type" = lxc ] && ! has_opt "$opts" no-apps; then
+            case ",$tags," in *,community-script,*|*,proxmox-helper-scripts,*) APP_IDS+=("$id") ;; esac
+        fi
         ((PLANNED++)); return 0
     fi
 
     log "START: $label$via"
-    local snap="" guest_failed=false pkgs=0 reboot=no
+    local snap="" guest_failed=false pkgs=0 reboot=no cs_update=""
 
     # ── Snapshot ──
     if [ "$do_snap" = true ]; then
@@ -885,7 +920,7 @@ process_guest() {
             local update_rc upgrade_rc newinst autoremove_rc
             update_rc=$(kv "$res" update_rc); upgrade_rc=$(kv "$res" upgrade_rc)
             pkgs=$(kv "$res" upgraded); newinst=$(kv "$res" newinst); autoremove_rc=$(kv "$res" autoremove_rc)
-            reboot=$(kv "$res" reboot)
+            reboot=$(kv "$res" reboot); cs_update=$(kv "$res" cs)
             if [ "${upgrade_rc:-1}" -ne 0 ]; then
                 log "FAIL: $label -- $pm upgrade failed (rc $upgrade_rc)$snap_hint"
                 FAIL_LIST+=("$label: $pm upgrade rc $upgrade_rc$snap_hint"); guest_failed=true
@@ -971,7 +1006,14 @@ process_guest() {
         ((FAILED++)); return 0
     fi
     ((SUCCESS++))
-    [ "$type" = lxc ] && APP_IDS+=("$id")   # eligible for community-scripts app updates
+    # Eligible for the community-scripts app update: tagged as such, or it carries the
+    # community /usr/bin/update tool. update-apps.sh does not filter an explicit ID list itself.
+    if [ "$type" = lxc ] && ! has_opt "$opts" no-apps; then
+        case ",$tags," in
+            *,community-script,*|*,proxmox-helper-scripts,*) APP_IDS+=("$id") ;;
+            *) [ "$cs_update" = yes ] && APP_IDS+=("$id") ;;
+        esac
+    fi
 
     # ── Reboot if pending (opt-in) ──
     if [ "$reboot" = yes ]; then
@@ -1021,19 +1063,46 @@ run_app_updates() {
         var_skip_confirm=yes \
         var_continue_on_error=yes \
         var_auto_reboot="$APP_UPDATE_REBOOT" \
-        timeout "$APP_UPDATE_TIMEOUT" bash "$tmp" </dev/null >"$app_log" 2>&1
+        timeout -k 60 "$APP_UPDATE_TIMEOUT" bash "$tmp" </dev/null >"$app_log" 2>&1
     rc=$?
     rm -f "$tmp"
     sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$app_log" 2>/dev/null
 
     # Summary table rows: "  <ctid>  <service>  <STATUS>  <details>"
-    local ok fail restored err skipped fail_names
+    local ok skipped
     ok=$(grep -cE '^\s+[0-9]+\s+\S+\s+OK\b' "$app_log")
-    fail=$(grep -cE '^\s+[0-9]+\s+\S+\s+FAILED\b' "$app_log")
-    restored=$(grep -cE '^\s+[0-9]+\s+\S+\s+RESTORED\b' "$app_log")
-    err=$(grep -cE '^\s+[0-9]+\s+\S+\s+ERROR\b' "$app_log")
     skipped=$(grep -cE '^\s+[0-9]+\s+\S+\s+SKIPPED\b' "$app_log")
-    fail_names=$(grep -E '^\s+[0-9]+\s+\S+\s+(FAILED|RESTORED|ERROR)\b' "$app_log" | awk '{print $2"("$1")"}' | paste -sd, - | sed 's/,/, /g')
+
+    # Some app updaters stop at a question ("Do you want to continue? (y/N)"). With no
+    # terminal they fail at once instead of hanging. That is not a broken update, it is a
+    # decision a human must make once, so report it separately with the command to run.
+    local manual_ids
+    manual_ids=" $(awk '
+        /Updating container [0-9]+/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) id = $i; ask = 0 }
+        /read -r?p |\(y\/N\)|\(Y\/n\)|\[y\/N\]|\[Y\/n\]|interactive/ { ask = 1 }
+        /failed for container [0-9]+/ { if (ask) print id; ask = 0 }
+    ' "$app_log" | sort -u | tr '\n' ' ')"
+
+    local id name status details manual_n=0 fail_n=0 manual_names="" fail_names=""
+    while read -r id name status details; do
+        case "$status:$details" in
+            ERROR:*"missing service name"*)
+                log "APPS: $id is not a community-scripts container, ignoring"; continue ;;
+            SKIPPED:*interactive*) ;;
+            SKIPPED:*)
+                WARN_LIST+=("$name ($id): app update skipped: $details"); continue ;;
+            FAILED:*|RESTORED:*|ERROR:*) ;;
+            *) continue ;;
+        esac
+        if [ "$status" = SKIPPED ] || [[ "$manual_ids" == *" $id "* ]]; then
+            manual_n=$((manual_n + 1)); manual_names+="${manual_names:+, }$name($id)"
+            WARN_LIST+=("$name ($id): app update asks a question, run it once by hand: pct exec $id -- update")
+        else
+            fail_n=$((fail_n + 1)); fail_names+="${fail_names:+, }$name($id)${details:+ [$details]}"
+        fi
+    done < <(grep -E '^\s+[0-9]+\s+\S+\s+(FAILED|RESTORED|ERROR|SKIPPED)\b' "$app_log")
+    local manual_note=""
+    [ "$manual_n" -gt 0 ] && manual_note=", $manual_n need a manual run ($manual_names)"
 
     if [ "$rc" -eq 124 ]; then
         APP_STATUS="timed out after ${APP_UPDATE_TIMEOUT}s"
@@ -1042,17 +1111,18 @@ run_app_updates() {
     elif [ "$rc" -eq 234 ]; then
         APP_STATUS="no community-script containers"
         log "APPS: no containers matched (exit 234)"
-    elif [ $((fail + restored + err)) -gt 0 ]; then
-        APP_STATUS="$ok OK, $((fail + restored + err)) failed ($fail_names)"
+    elif [ "$fail_n" -gt 0 ]; then
+        APP_STATUS="$ok OK, $fail_n failed ($fail_names)$manual_note"
         FAIL_LIST+=("app-updates: $fail_names")
         log "FAIL: update-apps.sh -- $APP_STATUS (see $app_log)"
     elif [ "$rc" -ne 0 ]; then
-        APP_STATUS="exit $rc, $ok OK"
+        APP_STATUS="exit $rc, $ok OK$manual_note"
         FAIL_LIST+=("app-updates: exit $rc")
         log "FAIL: update-apps.sh exited $rc (see $app_log)"
     else
-        APP_STATUS="$ok OK${skipped:+, $skipped skipped}"
-        [ "$ok" -eq 0 ] && APP_STATUS="nothing to update"
+        APP_STATUS="$ok OK$manual_note"
+        [ "$ok" -eq 0 ] && [ "$manual_n" -eq 0 ] && APP_STATUS="nothing to update"
+        [ "$skipped" -gt "$manual_n" ] && APP_STATUS+=", $((skipped - manual_n)) skipped"
         log "APPS: $APP_STATUS"
     fi
 }
@@ -1298,7 +1368,10 @@ main() {
         done
     fi
 
-    if [ "$UPDATE_APPS" = true ]; then
+    if [ "$NO_APPS" = true ]; then
+        APP_STATUS="skipped (--no-apps)"
+        log "APPS: skipped (--no-apps)"
+    elif [ "$UPDATE_APPS" = true ]; then
         run_app_updates
     fi
 

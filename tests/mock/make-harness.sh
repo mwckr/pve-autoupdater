@@ -213,11 +213,21 @@ EOF
 cat > fake-update-apps.sh <<'EOF'
 #!/usr/bin/env bash
 echo "mock update-apps.sh: containers=$var_container backup=$var_backup unattended=$var_unattended continue=$var_continue_on_error reboot=$var_auto_reboot"
+echo "[INFO] Updating container 115"
+echo "[ERROR] in line 120: exit code 1: while executing command npm install"
+echo "Update failed for container 115 (exit code: 1)"
+echo "[INFO] Updating container 117"
+echo "[WARN] Before continuing make sure that you do not use encryption or have decrypted all documents."
+echo "[ERROR] in line 66: exit code 1 (The command failed; its output says why): while executing command read -rp 'Do you want to continue with the update? (y/N): ' MIGRATE"
+echo "Update failed for container 117 (exit code: 1)"
 echo "  CTID      Service                 Status      Details"
 echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 printf "  %-8s  %-22s  %-10s  %s\n" 101 audiomuse-ai OK "Updated successfully"
 printf "  %-8s  %-22s  %-10s  %s\n" 102 radio OK "Updated successfully"
+printf "  %-8s  %-22s  %-10s  %s\n" 102 "(unknown)" ERROR "Invalid or missing service name in /usr/bin/update"
+printf "  %-8s  %-22s  %-10s  %s\n" 103 adguard SKIPPED "Storage critically low on /boot (>80%)"
 printf "  %-8s  %-22s  %-10s  %s\n" 115 jellyfin FAILED "Exit code 1"
+printf "  %-8s  %-22s  %-10s  %s\n" 117 paperless FAILED "Exit code 1"
 printf "  %-8s  %-22s  %-10s  %s\n" 119 n8n SKIPPED "no update script"
 exit 0
 EOF
