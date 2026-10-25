@@ -359,3 +359,11 @@ cat > overrides.conf <<'EOO'
 112|no-snapshot
 EOO
 echo "harness ready in $M  (next: bash run-test.sh --list)"
+
+# setsid is not available in Git Bash: drop -w and run the command directly
+cat > bin/setsid <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = "-w" ] && shift
+exec "$@"
+EOF
+chmod +x bin/setsid

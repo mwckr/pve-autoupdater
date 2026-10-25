@@ -93,7 +93,7 @@ ONLY_IDS="${ONLY_IDS//,/ }"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-for cmd in pct qm pvesh perl flock timeout; do
+for cmd in pct qm pvesh perl flock timeout setsid; do
     command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' not found. This script must run on a Proxmox VE host."
 done
 perl -MJSON::PP -e 1 2>/dev/null || die "perl JSON::PP module missing (it ships with perl on PVE)."
@@ -177,10 +177,14 @@ EXEC_IP=""
 # Logging
 # ═══════════════════════════════════════════════════════════════════════
 
+# fd 3 = the console. A signal handler may run while a child's stdout is redirected
+# to a file, so log() must not depend on stdout.
+exec 3>&1
+
 log() {
     local msg
     msg="[$(date '+%H:%M:%S')] $1"
-    echo "$msg"
+    echo "$msg" >&3
     [ -d "$LOG_DIR" ] && echo "$msg" >> "$LOG_FILE"
 }
 
@@ -234,7 +238,9 @@ start_watchdog() {
 
 on_exit() {
     local rc=$?
+    kill_child
     [ -n "$WATCHDOG_PID" ] && kill "$WATCHDOG_PID" 2>/dev/null
+    [ -n "$GUEST_OUT" ] && rm -f "$GUEST_OUT"
     if [ "$RUN_COMPLETED" = false ] && [ "$LIST_ONLY" = false ]; then
         log "FATAL: run aborted (exit $rc) before completion"
         if [ "$NTFY_ENABLED" = true ]; then
@@ -248,7 +254,8 @@ on_exit() {
 }
 
 on_term() {
-    log "FATAL: received SIGTERM/SIGINT"
+    log "FATAL: received SIGTERM/SIGINT -- stopping the running command"
+    kill_child
     exit 143
 }
 
@@ -512,25 +519,69 @@ guest_status() {
 # Executing scripts inside guests
 # ═══════════════════════════════════════════════════════════════════════
 
-# guest_exec <type> <id> <script> <timeout>  → stdout: output, rc: script exit (124 on timeout)
+# ── Interruptible, terminal-free execution ──
+# Long commands run as a background child that we `wait` for, so SIGINT/SIGTERM
+# (Ctrl-C, the watchdog, cron killing us) are handled immediately instead of after
+# the command finishes. CHILD_PID is always a `timeout` process: it owns its own
+# process group and forwards the signal to everything below it.
+#
+# `setsid -w` detaches the child from the controlling terminal. Guest commands and the
+# community update script therefore behave exactly like under cron even when started
+# by hand: nothing can open /dev/tty, grab the foreground process group, or make
+# `pct exec` allocate a pty (which puts the console into raw mode and eats Ctrl-C).
+CHILD_PID=""
+run_child() {
+    setsid -w "$@" 3>&- 9>&- &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    local rc=$?
+    CHILD_PID=""
+    return "$rc"
+}
+kill_child() {
+    [ -n "$CHILD_PID" ] || return 0
+    kill -TERM "$CHILD_PID" 2>/dev/null
+    sleep 2
+    kill -KILL "$CHILD_PID" 2>/dev/null
+    CHILD_PID=""
+}
+
+# guest_exec <type> <id> <script> <timeout>
+# Output is written to the file $GUEST_OUT; the return code is the script's (124 on timeout).
+GUEST_OUT=""
 guest_exec() {
-    local type="$1" id="$2" script="$3" t="$4"
-    # 9>&- : children must not inherit the lock file descriptor
-    if [ "$type" = lxc ]; then
-        timeout $((t + 30)) pct exec "$id" -- sh -c "$script" 2>&1 9>&-
-        return
-    fi
-    case "$EXEC_METHOD" in
-        agent)
-            timeout $((t + 60)) qm guest exec "$id" --timeout "$t" -- sh -c "$script" 2>&1 9>&- | agent_exec_decode
+    local type="$1" id="$2" script="$3" t="$4" rc raw
+    [ -n "$GUEST_OUT" ] || GUEST_OUT=$(mktemp "${TMPDIR:-/tmp}/pve-updater.out.XXXXXX")
+    : > "$GUEST_OUT"
+    # </dev/null nothing inside a guest may ever wait for keyboard input
+    case "$type:${EXEC_METHOD:-}" in
+        lxc:*)
+            run_child timeout $((t + 30)) pct exec "$id" -- sh -c "$script" </dev/null >"$GUEST_OUT" 2>&1
             ;;
-        ssh)
-            printf '%s\n' "$script" | timeout $((t + 30)) ssh -o ConnectTimeout=10 -o BatchMode=yes \
+        vm:agent)
+            raw=$(mktemp "${TMPDIR:-/tmp}/pve-updater.raw.XXXXXX")
+            run_child timeout $((t + 60)) qm guest exec "$id" --timeout "$t" -- sh -c "$script" </dev/null >"$raw" 2>&1
+            rc=$?
+            if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
+                echo "qm guest exec terminated (rc $rc)" >"$GUEST_OUT"; rm -f "$raw"; return "$rc"
+            fi
+            agent_exec_decode <"$raw" >"$GUEST_OUT" 2>&1
+            rc=$?
+            rm -f "$raw"
+            return "$rc"
+            ;;
+        vm:ssh)
+            raw=$(mktemp "${TMPDIR:-/tmp}/pve-updater.script.XXXXXX")
+            printf '%s\n' "$script" >"$raw"
+            run_child timeout $((t + 30)) ssh -o ConnectTimeout=10 -o BatchMode=yes \
                 -o StrictHostKeyChecking=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 \
-                "$VM_SSH_USER@$EXEC_IP" sh -s 2>&1 9>&-
+                "$VM_SSH_USER@$EXEC_IP" sh -s <"$raw" >"$GUEST_OUT" 2>&1
+            rc=$?
+            rm -f "$raw"
+            return "$rc"
             ;;
         *)
-            echo "no execution method for VM $id"; return 96
+            echo "no execution method for VM $id" >"$GUEST_OUT"; return 96
             ;;
     esac
 }
@@ -643,8 +694,9 @@ run_hook() {
     log "HOOK: $label -- running $phase hook"
     local body out rc
     body=$(cat "$hook_file")
-    out=$(guest_exec "$type" "$id" "$body" "$APT_TIMEOUT")
+    guest_exec "$type" "$id" "$body" "$APT_TIMEOUT"
     rc=$?
+    out=$(<"$GUEST_OUT")
     log_block "$out" 40
     if [ "$rc" -ne 0 ]; then
         if [ "$phase" = pre ]; then
@@ -766,7 +818,8 @@ process_guest() {
     # ── Dry run: probe only ──
     if [ "$DRY_RUN" = true ]; then
         local probe
-        probe=$(guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60); rc=$?
+        guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60; rc=$?
+        probe=$(<"$GUEST_OUT")
         local pm docker stacks free_mb
         pm=$(kv "$probe" pm); docker=$(kv "$probe" docker); stacks=$(kv "$probe" stacks); free_mb=$(kv "$probe" free_mb)
         if [ "$rc" -ne 0 ] || [ -z "$pm" ]; then
@@ -814,7 +867,8 @@ process_guest() {
         local out res pm
         # APT_TIMEOUT applies per apt command inside the guest (update, upgrade, autoremove);
         # the outer budget only guards against a hung pct/qm/ssh.
-        out=$(guest_exec "$type" "$id" "$script" $((APT_TIMEOUT * 3))); rc=$?
+        guest_exec "$type" "$id" "$script" $((APT_TIMEOUT * 3)); rc=$?
+        out=$(<"$GUEST_OUT")
         res=$(printf '%s\n' "$out" | grep '^##RESULT' | tail -n 1)
         log_block "$(printf '%s\n' "$out" | grep -v '^##RESULT')" 60
         pm=$(kv "$res" pm)
@@ -852,7 +906,8 @@ process_guest() {
     local stacks_n=1
     if [ "$do_docker" = true ] && [ "$guest_failed" = false ]; then
         local probe docker_present
-        probe=$(guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60); rc=$?
+        guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60; rc=$?
+        probe=$(<"$GUEST_OUT")
         docker_present=$(kv "$probe" docker)
         if [ -z "$docker_present" ]; then
             log "WARN: $label -- docker probe failed (rc $rc): $(printf '%s' "$probe" | tail -n 1)"
@@ -867,7 +922,8 @@ process_guest() {
     if [ "$do_docker" = true ] && [ "$guest_failed" = false ]; then
         local script out res
         script="UPD_TIMEOUT=$DOCKER_TIMEOUT"$'\n'"$GUEST_DOCKER_SCRIPT"
-        out=$(guest_exec "$type" "$id" "$script" $((DOCKER_TIMEOUT * stacks_n + 60))); rc=$?
+        guest_exec "$type" "$id" "$script" $((DOCKER_TIMEOUT * stacks_n + 60)); rc=$?
+        out=$(<"$GUEST_OUT")
         res=$(printf '%s\n' "$out" | grep '^##DOCKER' | tail -n 1)
         if [ -z "$res" ]; then
             log_block "$out" 40
@@ -954,13 +1010,18 @@ run_app_updates() {
     fi
 
     log "APPS: running update-apps.sh for $(join_by , "${APP_IDS[@]}")"
-    var_backup="$APP_UPDATE_BACKUP" \
-    var_container="$(join_by , "${APP_IDS[@]}")" \
-    var_unattended=yes \
-    var_skip_confirm=yes \
-    var_continue_on_error=yes \
-    var_auto_reboot="$APP_UPDATE_REBOOT" \
-    timeout "$APP_UPDATE_TIMEOUT" bash "$tmp" > "$app_log" 2>&1
+    log "APPS: this phase is silent here and can take a long time -- follow it with: tail -f $app_log"
+    # Detached from the terminal (setsid), stdin from /dev/null, TERM=dumb: the community
+    # script reads its prompts from /dev/tty and even re-takes the foreground process group,
+    # so a manual run must look exactly like a cron run to it or it can hang the console.
+    run_child env TERM=dumb \
+        var_backup="$APP_UPDATE_BACKUP" \
+        var_container="$(join_by , "${APP_IDS[@]}")" \
+        var_unattended=yes \
+        var_skip_confirm=yes \
+        var_continue_on_error=yes \
+        var_auto_reboot="$APP_UPDATE_REBOOT" \
+        timeout "$APP_UPDATE_TIMEOUT" bash "$tmp" </dev/null >"$app_log" 2>&1
     rc=$?
     rm -f "$tmp"
     sed -i 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$app_log" 2>/dev/null
@@ -1046,7 +1107,7 @@ update_pve_host() {
     export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
     local apt_opts=(-o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef -o DPkg::Lock::Timeout=300)
     local update_warn=""
-    if ! timeout "$APT_TIMEOUT" apt-get -q update >> "$LOG_FILE" 2>&1; then
+    if ! run_child timeout "$APT_TIMEOUT" apt-get -q update </dev/null >>"$LOG_FILE" 2>&1; then
         update_warn=", repo errors"
         WARN_LIST+=("PVE host: apt update errors (enterprise repo without subscription?)")
         log "WARN: PVE host -- apt-get update reported errors, continuing"
@@ -1074,10 +1135,10 @@ update_pve_host() {
     fi
 
     log "PVE: $n_inst package(s) to upgrade -- installing: $(printf '%s\n' "$sim" | awk '/^Inst /{print $2}' | paste -sd' ' -)"
-    if timeout "$APT_TIMEOUT" apt-get -y -q "${apt_opts[@]}" dist-upgrade >> "$LOG_FILE" 2>&1; then
+    if run_child timeout "$APT_TIMEOUT" apt-get -y -q "${apt_opts[@]}" dist-upgrade </dev/null >>"$LOG_FILE" 2>&1; then
         PVE_STATUS="$n_inst upgraded$update_warn"
         if [ "$APT_AUTOREMOVE" = true ]; then
-            timeout "$APT_TIMEOUT" apt-get -y -q "${apt_opts[@]}" autoremove >> "$LOG_FILE" 2>&1 || log "WARN: PVE host -- autoremove failed"
+            run_child timeout "$APT_TIMEOUT" apt-get -y -q "${apt_opts[@]}" autoremove </dev/null >>"$LOG_FILE" 2>&1 || log "WARN: PVE host -- autoremove failed"
         fi
         if host_reboot_pending; then
             PVE_STATUS+=" -- REBOOT PENDING"; REBOOT_LIST+=("PVE host")
@@ -1172,7 +1233,8 @@ print_inventory() {
             fi
             if [ "$type" = lxc ] || [ -n "$EXEC_METHOD" ]; then
                 local probe pm docker stacks
-                probe=$(guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60)
+                guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60
+                probe=$(<"$GUEST_OUT")
                 pm=$(kv "$probe" pm); docker=$(kv "$probe" docker); stacks=$(kv "$probe" stacks)
                 [ "$pm" = none ] && pm="no-apt/apk"
                 has_opt "$opts" no-apt || plan+="${pm:-probe-failed} "

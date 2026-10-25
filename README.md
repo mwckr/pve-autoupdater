@@ -154,6 +154,8 @@ Logs: `logs/latest.log` points at the current run, `logs/update-*.log` hold the 
 
 ## Troubleshooting
 
+**A manual run looks stuck** — the community app-update phase prints nothing to the console; follow it with `tail -f logs/app-update-*.log`. Ctrl-C stops a run at any point, kills the running command and sends an ABORTED notification. Guest commands and the community script run detached from your terminal, so nothing inside them can grab the console or wait for a keypress.
+
 **"another instance is running"** — a run is still going (`ps aux | grep pve-updater`). The lock disappears the moment the process ends, there is nothing to clean up.
 
 **VM: "no guest agent and no ip=…"** — install `qemu-guest-agent` in the VM and enable it in the VM options, or add `<VMID>|ip=<address>` to `overrides.conf` and run `./setup-ssh.sh <VMID>`.
