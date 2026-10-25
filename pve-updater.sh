@@ -812,7 +812,9 @@ process_guest() {
         local is_vm=0; [ "$type" = vm ] && is_vm=1
         local script="UPD_TIMEOUT=$APT_TIMEOUT; UPD_IS_VM=$is_vm; UPD_AUTOREMOVE=$APT_AUTOREMOVE; UPD_MIN_FREE_MB=$MIN_FREE_MB"$'\n'"$GUEST_PKG_SCRIPT"
         local out res pm
-        out=$(guest_exec "$type" "$id" "$script" "$APT_TIMEOUT"); rc=$?
+        # APT_TIMEOUT applies per apt command inside the guest (update, upgrade, autoremove);
+        # the outer budget only guards against a hung pct/qm/ssh.
+        out=$(guest_exec "$type" "$id" "$script" $((APT_TIMEOUT * 3))); rc=$?
         res=$(printf '%s\n' "$out" | grep '^##RESULT' | tail -n 1)
         log_block "$(printf '%s\n' "$out" | grep -v '^##RESULT')" 60
         pm=$(kv "$res" pm)
@@ -846,10 +848,26 @@ process_guest() {
     fi
 
     # ── Docker stacks ──
+    # Probe first: skip guests without Docker, and size the time budget by the number of running stacks.
+    local stacks_n=1
+    if [ "$do_docker" = true ] && [ "$guest_failed" = false ]; then
+        local probe docker_present
+        probe=$(guest_exec "$type" "$id" "$GUEST_PROBE_SCRIPT" 60); rc=$?
+        docker_present=$(kv "$probe" docker)
+        if [ -z "$docker_present" ]; then
+            log "WARN: $label -- docker probe failed (rc $rc): $(printf '%s' "$probe" | tail -n 1)"
+            WARN_LIST+=("$label: docker probe rc $rc")
+            do_docker=false
+        elif [ "$docker_present" != yes ]; then
+            do_docker=false
+        else
+            stacks_n=$(kv "$probe" stacks); [ "${stacks_n:-0}" -ge 1 ] || stacks_n=1
+        fi
+    fi
     if [ "$do_docker" = true ] && [ "$guest_failed" = false ]; then
         local script out res
         script="UPD_TIMEOUT=$DOCKER_TIMEOUT"$'\n'"$GUEST_DOCKER_SCRIPT"
-        out=$(guest_exec "$type" "$id" "$script" "$DOCKER_TIMEOUT"); rc=$?
+        out=$(guest_exec "$type" "$id" "$script" $((DOCKER_TIMEOUT * stacks_n + 60))); rc=$?
         res=$(printf '%s\n' "$out" | grep '^##DOCKER' | tail -n 1)
         if [ -z "$res" ]; then
             log_block "$out" 40

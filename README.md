@@ -164,6 +164,8 @@ Logs: `logs/latest.log` points at the current run, `logs/update-*.log` hold the 
 
 **Docker stacks not updated** — only stacks with running containers whose compose file still exists at the path Docker recorded are handled. Containers started with plain `docker run` are not managed; use a post-hook or Watchtower for those. Look at the run log for the per-stack detail.
 
+**Docker: "pull failed … toomanyrequests"** — Docker Hub rate-limits anonymous pulls per IP, and a guest with many stacks pulls them all in one burst. Run `docker login` once inside that container; authenticated pulls get a much higher limit.
+
 **"would remove core packages"** — run `apt-get -s dist-upgrade` on the host and check your repositories; this is almost always a wrong or missing repo entry.
 
 **A guest broke after an update** — roll back (see *Safety net*), then tag it `no-update` until you have looked into it.
