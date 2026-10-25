@@ -27,11 +27,13 @@ MIN_FREE_MB=500               # refuse to update a guest with less free space on
 HOST_MIN_FREE_MB=2048         # same for the PVE host
 
 # ── What to update ──
-UPDATE_PVE_HOST=true     # apt dist-upgrade on the PVE host itself (never reboots it)
+UPDATE_PVE_HOST=true     # apt dist-upgrade on the PVE host itself (reboot: see AUTO_REBOOT_HOST)
 UPDATE_DOCKER=true       # update running Docker Compose stacks in guests that have Docker
 APT_AUTOREMOVE=true      # apt-get autoremove after a successful upgrade (old kernels etc.)
 AUTO_REBOOT_LXC=false    # reboot containers that report a pending reboot (seconds of downtime)
 AUTO_REBOOT_VM=false     # reboot VMs that report a pending reboot (new kernel)
+AUTO_REBOOT_HOST=false   # reboot the PVE host itself after a kernel update, 1 minute after the
+                         # notification. Refused if any running guest lacks "Start at boot".
 
 # ── VMs ──
 VM_EXEC_METHOD=auto      # auto: QEMU guest agent if available, else SSH | agent | ssh

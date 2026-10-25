@@ -119,7 +119,7 @@ case "$cmd" in
   status)
     st=$(cat "$M/state/status-$id" 2>/dev/null || inv status); echo "status: $st" ;;
   config)
-    echo "ostype: debian"; echo "tags: $(inv tags)" ;;
+    echo "ostype: debian"; echo "tags: $(inv tags)"; [ "$id" = 126 ] || echo "onboot: 1" ;;
   exec)
     [ "$1" = "--" ] && shift
     exec "$M/bin/guest-run" "$id" "$@" ;;
@@ -146,6 +146,7 @@ cmd="$1"; shift
 inv() { perl -MJSON::PP -e 'local $/; my $d=decode_json(<STDIN>); for (@$d){ if ($_->{vmid}==$ARGV[0]) { print $_->{$ARGV[1]}//"", "\n"; exit } }' "$1" "$2" < "$M/state/inventory.json"; }
 case "$cmd" in
   status) id="$1"; echo "status: $(inv "$id" status)" ;;
+  config) echo "onboot: 1" ;;
   guest)
     sub="$1"; id="$2"; shift 2
     case "$id" in 131) echo "QEMU guest agent is not running" >&2; exit 2 ;; esac
@@ -317,8 +318,8 @@ case "$1" in
       echo "${proj}-db-1 Up 3 days"
       if [ "$proj" = paperless ]; then echo "paperless-webserver-1 Restarting (1) 2 seconds ago"; else echo "${proj}-web-1 Up 5 seconds"; fi
     elif printf '%s' "$args" | grep -q 'working_dir'; then
-      stacks | awk -v s="$S" '{print $1"|"s"/"$1"|"s"/"$1"/compose.yml"}'
-      echo "||"
+      stacks | awk -v s="$S" '{ env = ($1 == "mystack") ? s"/"$1"/compose.env" : ""; print $1"|"s"/"$1"|"s"/"$1"/compose.yml|"env }'
+      echo "|||"
     else
       stacks | awk '{print $1}'; echo ""
     fi ;;
@@ -341,7 +342,7 @@ EOF
 
 for id in 110 112 117 127; do
   for s in ntfy mystack paperless komodo immich; do
-    mkdir -p "state/stacks/$id/$s"; echo "services: {}" > "state/stacks/$id/$s/compose.yml"
+    mkdir -p "state/stacks/$id/$s"; echo "services: {}" > "state/stacks/$id/$s/compose.yml"; echo "X=1" > "state/stacks/$id/$s/compose.env"
   done
 done
 cp bin/apt-get bin/dpkg bin/df guest-deb/
@@ -371,6 +372,21 @@ EOO
 echo "harness ready in $M  (next: bash run-test.sh --list)"
 
 # setsid is not available in Git Bash: drop -w and run the command directly
+cat > bin/proxmox-boot-tool <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = kernel ] && [ "$2" = list ]; then
+  echo "Manually selected kernels:"; echo "None."; echo
+  echo "Automatically selected kernels:"; echo "6.8.12-9-pve"; echo
+  echo "Pinned kernel:"; echo "${MOCK_PINNED_KERNEL:-6.8.12-9-pve}"
+fi
+EOF
+chmod +x bin/proxmox-boot-tool
+cat > bin/shutdown <<'EOF'
+#!/usr/bin/env bash
+M="$(cd "$(dirname "$0")/.." && pwd)"
+echo "shutdown $*" >> "$M/state/calls.log"
+EOF
+chmod +x bin/shutdown
 cat > bin/setsid <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = "-w" ] && shift

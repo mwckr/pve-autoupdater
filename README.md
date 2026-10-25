@@ -16,7 +16,7 @@ There is **no inventory to maintain**. Guests are discovered from Proxmox on eve
    - checks the guest is **still running** (and starts it again if not)
    - records whether a **reboot is pending**; reboots only if you enable it
 3. Runs the community-scripts **`update-apps.sh`** for containers that updated successfully and are either tagged `community-script` or carry the community `/usr/bin/update` tool (optional). Be aware that this phase is by far the slowest part of a run: every app's own updater runs in turn, often re-running apt and downloading the application, so 20 containers can take two to three hours. If that is too long for a weekly window, set `UPDATE_APPS=false` and run `./pve-updater.sh` with apps enabled less often, or keep it and accept the runtime.
-4. Updates the **PVE host** with `apt-get dist-upgrade`, which is what Proxmox recommends and what the GUI's Upgrade button runs. It refuses to continue if the upgrade would remove core Proxmox packages, waits for a running vzdump to finish, and never reboots the host.
+4. Updates the **PVE host** with `apt-get dist-upgrade`, which is what Proxmox recommends and what the GUI's Upgrade button runs. It refuses to continue if the upgrade would remove core Proxmox packages and waits for a running vzdump to finish. A reboot into a new kernel only happens with `AUTO_REBOOT_HOST=true` (see *Safety net*).
 5. Sends the **ntfy summary**. The exit code is non-zero if anything failed.
 
 ### VMs
@@ -106,7 +106,7 @@ Stopped guests are skipped automatically, so there is no need to tag something y
 - **Interrupted dpkg runs heal themselves.** `dpkg --configure -a` runs before every upgrade.
 - **Locking and watchdog.** Only one instance can run (kernel `flock`, so stale locks cannot happen). A run that exceeds `MAX_RUNTIME` is aborted. Every external command has a timeout.
 - **Abort notification.** If the script dies for any reason before the summary, a high-priority *ABORTED* notification with the last log lines is sent, so a silent broken cron job is not possible.
-- **No automatic reboots** unless you set `AUTO_REBOOT_LXC` / `AUTO_REBOOT_VM`. Pending reboots are listed in every notification until done. The host is never rebooted.
+- **No automatic reboots** unless you set `AUTO_REBOOT_LXC` / `AUTO_REBOOT_VM`. Pending reboots are listed in every notification until done. The host is rebooted only with `AUTO_REBOOT_HOST=true`, and even then only if every running guest has *Start at boot* enabled, no backup is running, and the run was a full one. The notification goes out first, the reboot follows one minute later and can be cancelled with `shutdown -c`. A kernel pinned with `proxmox-boot-tool` is respected.
 - **Services restart automatically** after library updates when `needrestart` is installed in a guest (`apt install needrestart`); the script runs apt with `NEEDRESTART_MODE=a`.
 
 ## Hooks

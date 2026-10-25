@@ -129,6 +129,7 @@ SNAPSHOT_REQUIRED="${SNAPSHOT_REQUIRED:-false}"
 APT_AUTOREMOVE="${APT_AUTOREMOVE:-true}"
 AUTO_REBOOT_LXC="${AUTO_REBOOT_LXC:-false}"
 AUTO_REBOOT_VM="${AUTO_REBOOT_VM:-false}"
+AUTO_REBOOT_HOST="${AUTO_REBOOT_HOST:-false}"
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 HOST_MIN_FREE_MB="${HOST_MIN_FREE_MB:-2048}"
 MAX_RUNTIME="${MAX_RUNTIME:-14400}"
@@ -169,6 +170,8 @@ PKG_TOTAL=0        # packages upgraded across all guests
 declare -a FAIL_LIST=() WARN_LIST=() SKIP_LIST=() REBOOT_LIST=() REBOOTED_LIST=() DOCKER_LIST=() DEFERRED=() APP_IDS=()
 PVE_STATUS=""
 APP_STATUS=""
+HOST_REBOOT_PENDING=false
+HOST_REBOOT=false   # decided at the end: reboot the host after the notification
 RUN_COMPLETED=false
 WATCHDOG_PID=""
 
@@ -375,8 +378,8 @@ else echo "##DOCKER present=yes compose=no"; exit 0; fi
 T=""
 command -v timeout >/dev/null 2>&1 && T="timeout $UPD_TIMEOUT"
 stacks=0; updated=0; errors=0; unhealthy=""
-projects=$(docker ps --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}' 2>/dev/null | grep -v '^|' | sort -u)
-while IFS='|' read -r proj wd cfgs; do
+projects=$(docker ps --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.environment_file"}}' 2>/dev/null | grep -v '^|' | sort -u)
+while IFS='|' read -r proj wd cfgs envs; do
     [ -z "$proj" ] && continue
     stacks=$((stacks + 1))
     echo ">> $proj ($wd)"
@@ -387,6 +390,11 @@ while IFS='|' read -r proj wd cfgs; do
         case "$f" in /*) ;; *) f="$wd/$f" ;; esac
         [ -f "$f" ] || missing=1
         set -- "$@" -f "$f"
+    done
+    # stacks started with --env-file (e.g. Komodo's compose.env) need it again, or variables come up empty
+    for f in $envs; do
+        case "$f" in /*) ;; *) f="$wd/$f" ;; esac
+        [ -f "$f" ] && set -- "$@" --env-file "$f"
     done
     IFS=$oldIFS
     if [ "$missing" = 1 ] || [ ! -d "$wd" ] || [ $# -eq 0 ]; then
@@ -1133,10 +1141,39 @@ run_app_updates() {
 
 host_reboot_pending() {
     [ -f /var/run/reboot-required ] && return 0
-    local newest running
-    newest=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f#/boot/vmlinuz-}"; done | sort -V | tail -n 1)
+    local newest running pinned=""
     running=$(uname -r)
+    # A kernel pinned with proxmox-boot-tool is the one that should be running, not the newest.
+    if command -v proxmox-boot-tool >/dev/null 2>&1; then
+        pinned=$(proxmox-boot-tool kernel list 2>/dev/null | awk '/^Pinned kernel/ { getline; if ($0 !~ /^None/ && NF) print $1; exit }')
+    fi
+    if [ -n "$pinned" ]; then
+        [ "$pinned" != "$running" ]; return
+    fi
+    newest=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f#/boot/vmlinuz-}"; done | sort -V | tail -n 1)
     [ -n "$newest" ] && [ "$newest" != "$running" ]
+}
+
+# AUTO_REBOOT_HOST: only when every running guest will come back on its own.
+plan_host_reboot() {
+    local inventory id type name status rest cfg missing=""
+    inventory=$(discover_guests) || { WARN_LIST+=("PVE host reboot skipped: could not re-read the inventory"); return 1; }
+    while IFS='|' read -r id type name status rest; do
+        [ -n "$id" ] && [ "$status" = running ] || continue
+        if [ "$type" = lxc ]; then cfg=$(timeout 30 pct config "$id" 2>/dev/null); else cfg=$(timeout 30 qm config "$id" 2>/dev/null); fi
+        printf '%s\n' "$cfg" | grep -q '^onboot: 1' || missing+="${missing:+, }${name:-$type} ($id)"
+    done <<< "$inventory"
+    if [ -n "$missing" ]; then
+        log "WARN: PVE host reboot skipped -- running guests without 'Start at boot': $missing"
+        WARN_LIST+=("PVE host reboot skipped, these running guests lack 'Start at boot': $missing")
+        return 1
+    fi
+    if ! wait_for_backups; then
+        log "WARN: PVE host reboot skipped -- a backup is still running"
+        WARN_LIST+=("PVE host reboot skipped: backup running")
+        return 1
+    fi
+    HOST_REBOOT=true
 }
 
 backup_running() {
@@ -1200,7 +1237,7 @@ update_pve_host() {
 
     if [ "$n_inst" -eq 0 ]; then
         PVE_STATUS="already up to date$update_warn"
-        host_reboot_pending && { PVE_STATUS+=" -- REBOOT PENDING"; REBOOT_LIST+=("PVE host"); }
+        host_reboot_pending && { PVE_STATUS+=" -- REBOOT PENDING"; REBOOT_LIST+=("PVE host"); HOST_REBOOT_PENDING=true; }
         log "PVE: $PVE_STATUS"; return 0
     fi
 
@@ -1211,7 +1248,7 @@ update_pve_host() {
             run_child timeout "$APT_TIMEOUT" apt-get -y -q "${apt_opts[@]}" autoremove </dev/null >>"$LOG_FILE" 2>&1 || log "WARN: PVE host -- autoremove failed"
         fi
         if host_reboot_pending; then
-            PVE_STATUS+=" -- REBOOT PENDING"; REBOOT_LIST+=("PVE host")
+            PVE_STATUS+=" -- REBOOT PENDING"; REBOOT_LIST+=("PVE host"); HOST_REBOOT_PENDING=true
         fi
     else
         PVE_STATUS="FAILED: apt dist-upgrade exited non-zero -- check log"
@@ -1254,7 +1291,7 @@ send_summary() {
     [ "$SKIPPED" -gt 0 ] && msg+="  |  Skipped: $SKIPPED"
     [ "$n_fail" -gt 0 ]            && msg+=$'\n'"Failed: $(join_by '; ' "${FAIL_LIST[@]}")"
     [ ${#WARN_LIST[@]} -gt 0 ]     && msg+=$'\n'"Warnings: $(join_by '; ' "${WARN_LIST[@]}")"
-    [ ${#REBOOT_LIST[@]} -gt 0 ]   && msg+=$'\n'"Reboot pending: $(join_by ', ' "${REBOOT_LIST[@]}")"
+    [ ${#REBOOT_LIST[@]} -gt 0 ]   && msg+=$'\n'"Reboot pending (not done automatically): $(join_by ', ' "${REBOOT_LIST[@]}")"
     [ ${#REBOOTED_LIST[@]} -gt 0 ] && msg+=$'\n'"Rebooted: $(join_by ', ' "${REBOOTED_LIST[@]}")"
     [ ${#DOCKER_LIST[@]} -gt 0 ]   && msg+=$'\n'"Docker updated: $(join_by ', ' "${DOCKER_LIST[@]}")"
     if [ ${#SKIP_LIST[@]} -gt 0 ] || [ "$STOPPED" -gt 0 ]; then
@@ -1265,6 +1302,7 @@ send_summary() {
     fi
     [ -n "$APP_STATUS" ] && msg+=$'\n'"App updates: $APP_STATUS"
     msg+=$'\n'"PVE host: $PVE_STATUS"
+    [ "$HOST_REBOOT" = true ] && msg+=" -- REBOOTING in 1 minute (AUTO_REBOOT_HOST)"
     msg+=$'\n'"Duration: $((duration / 60))m $((duration % 60))s"
 
     ntfy_send "$title" "$priority" "$tags" "$msg"
@@ -1404,8 +1442,18 @@ main() {
     log "  Log: $LOG_FILE"
     log "════════════════════════════════════════════════════"
 
+    if [ "$AUTO_REBOOT_HOST" = true ] && [ "$HOST_REBOOT_PENDING" = true ] && [ "$DRY_RUN" = false ] && [ -z "$ONLY_IDS" ]; then
+        plan_host_reboot || true
+    fi
+
     send_summary
     RUN_COMPLETED=true
+
+    if [ "$HOST_REBOOT" = true ]; then
+        log "PVE: rebooting the host in 1 minute (AUTO_REBOOT_HOST=true); cancel with: shutdown -c"
+        shutdown -r +1 "pve-updater: rebooting into the updated kernel" >> "$LOG_FILE" 2>&1 \
+            || log "WARN: PVE host -- shutdown command failed"
+    fi
     log "Done."
     [ ${#FAIL_LIST[@]} -eq 0 ]
 }
